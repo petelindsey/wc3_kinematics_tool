@@ -1,0 +1,15 @@
+# caches / generated
+_cache_fbx/
+__pycache__/
+*.pyc
+
+# local config / db (adjust to your needs)
+config.json
+*.sqlite
+*.db
+
+# logs
+*.log
+
+# blender temp
+*.blend1
