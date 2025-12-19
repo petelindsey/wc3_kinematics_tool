@@ -1,0 +1,232 @@
+diff --git a/wc3kin/extract.py b/wc3kin/extract.py
+--- a/wc3kin/extract.py
++++ b/wc3kin/extract.py
+@@ -17,6 +17,7 @@
+ class ExtractResult:
+     ok: bool
+     armature_name: Optional[str]
+     bones: List[str]
+     animations: List[str]
++    animations_source: str  # 'original' (embedded) or 'per_action' (one FBX per clip)
+     warnings: List[str]
+     error: Optional[str]
+     # debugging
+@@ -115,6 +116,68 @@
+ def pick_extractor_script(project_root: Path) -> Path:
+     # After conversion, extraction always uses the generic extractor.
+     return _project_script(project_root, "blender_scripts/kin_extract.py")
+
++def _run_blender_extract_on_input(
++    blender_path: Path,
++    blender_script: Path,
++    input_path: Path,
++    logger=None,
++) -> tuple[dict, subprocess.CompletedProcess[str]]:
++    """Run the Blender extractor script for a single input file and return (json_dict, process)."""
++    with tempfile.TemporaryDirectory(prefix="wc3kin_") as td:
++        out_json = Path(td) / "extract.json"
++
++        cmd = [
++            str(blender_path),
++            "--background",
++            "--python",
++            str(blender_script),
++            "--",
++            "--input",
++            str(input_path),
++            "--output",
++            str(out_json),
++        ]
++
++        if logger:
++            logger.info("Running Blender extract: %s", " ".join(cmd))
++
++        p = subprocess.run(cmd, capture_output=True, text=True)
++
++        if logger:
++            if p.stdout.strip():
++                logger.info("Blender stdout:\n%s", p.stdout.strip())
++            if p.stderr.strip():
++                logger.warning("Blender stderr:\n%s", p.stderr.strip())
++
++        if not out_json.exists():
++            raise RuntimeError(
++                "Extractor did not produce output JSON.\n"
++                f"Command: {' '.join(cmd)}\n\n"
++                f"stdout:\n{p.stdout}\n\n"
++                f"stderr:\n{p.stderr}"
++            )
++
++        data = json.loads(out_json.read_text(encoding="utf-8"))
++        return data, p
++
++
++def _find_per_action_fbxs(base_fbx: Path) -> list[Path]:
++    """Return sorted per-action FBXs in sibling '<Unit>_anims' directory, if present."""
++    anim_dir = base_fbx.parent / f"{base_fbx.stem}_anims"
++    if not anim_dir.is_dir():
++        return []
++    return sorted(anim_dir.glob("*.fbx"), key=lambda p: p.name.lower())
++
++
++def _derive_anim_name_from_filename(unit_stem: str, anim_fbx: Path) -> str:
++    """Derive a stable clip name from '<Unit>_<Action>.fbx' -> '<Action>' (fallback to stem)."""
++    stem = anim_fbx.stem
++    prefix = unit_stem + "_"
++    if stem.startswith(prefix) and len(stem) > len(prefix):
++        return stem[len(prefix):]
++    return stem
++
+
+ def run_blender_extract(
+     blender_path: Path,
+     project_root: Path,
+@@ -151,69 +214,93 @@
+         raise FileNotFoundError(f"Model not found: {model_abspath}")
+
+     # Convert WC3 models first (mdl/mdx -> fbx cache), then extract from the FBX
+     model_for_extract = ensure_fbx_for_wc3_model(
+         blender_path=blender_path,
+         project_root=project_root,
+         model_abspath=model_abspath,
+         wc3_json_root=wc3_json_root,
+         texture_root=texture_root,
+         logger=logger,
+     )
+
+     blender_script = pick_extractor_script(project_root)
+     if not blender_script.exists():
+         raise FileNotFoundError(f"Blender extractor script not found: {blender_script}")
+
+-    with tempfile.TemporaryDirectory(prefix="wc3kin_") as td:
+-        out_json = Path(td) / "extract.json"
+-
+-        cmd = [
+-            str(blender_path),
+-            "--background",
+-            "--python",
+-            str(blender_script),
+-            "--",
+-            "--input",
+-            str(model_for_extract),
+-            "--output",
+-            str(out_json),
+-        ]
+-
+-        if logger:
+-            logger.info("Running Blender extract: %s", " ".join(cmd))
+-
+-        p = subprocess.run(cmd, capture_output=True, text=True)
+-
+-        if logger:
+-            if p.stdout.strip():
+-                logger.info("Blender stdout:\n%s", p.stdout.strip())
+-            if p.stderr.strip():
+-                logger.warning("Blender stderr:\n%s", p.stderr.strip())
+-
+-        if not out_json.exists():
+-            raise RuntimeError(
+-                "Extractor did not produce output JSON.\n"
+-                f"Command: {' '.join(cmd)}\n\n"
+-                f"stdout:\n{p.stdout}\n\n"
+-                f"stderr:\n{p.stderr}"
+-            )
+-
+-        data = json.loads(out_json.read_text(encoding="utf-8"))
+-        return ExtractResult(
+-            ok=bool(data.get("ok")),
+-            armature_name=data.get("armature_name"),
+-            bones=list(data.get("bones") or []),
+-            animations=list(data.get("animations") or []),
+-            warnings=list(data.get("warnings") or []),
+-            error=data.get("error"),
+-            blender_returncode=int(p.returncode),
+-            blender_stdout=p.stdout or "",
+-            blender_stderr=p.stderr or "",
+-            input_used=str(model_for_extract),
+-        )
++    # 1) Always extract bones from the base FBX we decided to use.
++    base_data, base_p = _run_blender_extract_on_input(
++        blender_path=blender_path,
++        blender_script=blender_script,
++        input_path=Path(model_for_extract),
++        logger=logger,
++    )
++
++    bones = list(base_data.get("bones") or [])
++    warnings = list(base_data.get("warnings") or [])
++    error = base_data.get("error")
++    armature_name = base_data.get("armature_name")
++
++    # 2) If a per-action directory exists next to the cached FBX, extract animations from each clip FBX.
++    per_action_fbxs = _find_per_action_fbxs(Path(model_for_extract))
++
++    animations: list[str] = []
++    animations_source = "original"
++
++    if per_action_fbxs:
++        animations_source = "per_action"
++        unit_stem = Path(model_for_extract).stem
++
++        for fbx in per_action_fbxs:
++            try:
++                clip_data, _clip_p = _run_blender_extract_on_input(
++                    blender_path=blender_path,
++                    blender_script=blender_script,
++                    input_path=fbx,
++                    logger=logger,
++                )
++                if clip_data.get("error"):
++                    warnings.append(f"Per-action extract error for {fbx.name}: {clip_data.get('error')}")
++                    continue
++
++                clip_anims = list(clip_data.get("animations") or [])
++                if clip_anims:
++                    animations.extend(clip_anims)
++                else:
++                    # Some per-action FBXs may not register an Action in bpy.data.actions.
++                    # Keep the pipeline deterministic by inserting a filename-derived name.
++                    animations.append(_derive_anim_name_from_filename(unit_stem, fbx))
++
++                clip_w = list(clip_data.get("warnings") or [])
++                for w in clip_w:
++                    warnings.append(f"{fbx.name}: {w}")
++
++            except Exception as e:
++                warnings.append(f"Per-action extract exception for {fbx.name}: {e!r}")
++                continue
++
++        animations = sorted(set(animations), key=lambda x: x.lower())
++    else:
++        # Legacy: animations embedded in the base FBX
++        animations = list(base_data.get("animations") or [])
++
++    return ExtractResult(
++        ok=bool(base_data.get("ok")),
++        armature_name=armature_name,
++        bones=bones,
++        animations=animations,
++        animations_source=animations_source,
++        warnings=warnings,
++        error=error,
++        blender_returncode=int(base_p.returncode),
++        blender_stdout=base_p.stdout or "",
++        blender_stderr=base_p.stderr or "",
++        input_used=str(model_for_extract),
++    )
+
+
+ def ingest_extract_to_db(con: sqlite3.Connection, unit_id: int, extracted: ExtractResult) -> None:
+@@ -214,9 +301,9 @@
+     if extracted.animations:
+         cur.executemany(
+             """
+             INSERT OR IGNORE INTO animations (unit_id, name, source, created_at)
+-            VALUES (?, ?, 'original', ?);
++            VALUES (?, ?, ?, ?);
+             """,
+-            [(unit_id, a, now) for a in extracted.animations],
++            [(unit_id, a, extracted.animations_source or 'original', now) for a in extracted.animations],
+         )
+
+     con.commit()
