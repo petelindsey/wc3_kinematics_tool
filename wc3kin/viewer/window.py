@@ -166,24 +166,4 @@ class ViewerWindow(tk.Toplevel):
             self.gl._impl._ortho_scale = max(span * 0.8, 100.0)
             self._fit_done = True
         self.gl.set_pose(pose, self._rig, active_ids=None)
-        if not hasattr(self, "_fit_done"):
-            xs = [p[0] for p in pose.world_pos.values()]
-            ys = [p[1] for p in pose.world_pos.values()]
-            zs = [p[2] for p in pose.world_pos.values()]
-            print(
-                f"POSE: {len(xs)} bones; "
-                f"x[{min(xs):.2f},{max(xs):.2f}] "
-                f"y[{min(ys):.2f},{max(ys):.2f}] "
-                f"z[{min(zs):.2f},{max(zs):.2f}]"
-            )
-
-            if xs:
-                span = max(
-                    max(xs) - min(xs),
-                    max(ys) - min(ys),
-                    max(zs) - min(zs),
-                )
-                self.gl._impl._ortho_scale = max(span * 0.75, 100.0)
-
-            self._fit_done = True
         self.time_lbl.config(text=f"t={self.t_ms}ms")

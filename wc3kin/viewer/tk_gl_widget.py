@@ -112,16 +112,16 @@ class GLViewerFrame(tk.Frame):
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
                 # --- DEBUG CROSSHAIR (always) ---
-                glLineWidth(4.0)
-                glBegin(GL_LINES)
-                glColor3f(1.0, 0.0, 0.0)
-                glVertex3f(-100.0, 0.0, 0.0)
-                glVertex3f(100.0, 0.0, 0.0)
+                #glLineWidth(4.0)
+                #glBegin(GL_LINES)
+                #glColor3f(1.0, 0.0, 0.0)
+                #glVertex3f(-100.0, 0.0, 0.0)
+                #glVertex3f(100.0, 0.0, 0.0)
 
-                glColor3f(0.0, 1.0, 0.0)
-                glVertex3f(0.0, -100.0, 0.0)
-                glVertex3f(0.0, 100.0, 0.0)
-                glEnd()
+                #glColor3f(0.0, 1.0, 0.0)
+                #glVertex3f(0.0, -100.0, 0.0)
+                #glVertex3f(0.0, 100.0, 0.0)
+                #glEnd()
 
                 pose = getattr(self_inner, "_pose", None)
                 rig = getattr(self_inner, "_rig", None)
@@ -145,9 +145,8 @@ class GLViewerFrame(tk.Frame):
                     p1 = pose.world_pos.get(oid)
                     if p0 is None or p1 is None:
                         continue
-                    if printed < 3:
-                        print("EDGE", pid, "->", oid, "p0=", p0, "p1=", p1)
-                        printed += 1 
+                    edge_count+=1
+
                     if active_ids is not None and oid in active_ids:
                         glColor3f(1.0, 0.8, 0.2)
                     else:
@@ -156,8 +155,11 @@ class GLViewerFrame(tk.Frame):
                     glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
                     glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
                 glEnd()
-                if edge_count == 0:
+                
+                if edge_count == 0 and not getattr(self_inner, "_warned_zero_edges", False):
                     print("WARNING: drew 0 bone edges (check parent_id wiring)")
+                    self_inner._warned_zero_edges = True
+                
                 glFlush()
 
 

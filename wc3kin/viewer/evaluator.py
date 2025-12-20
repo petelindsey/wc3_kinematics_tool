@@ -121,35 +121,29 @@ def _parse_quat(q: Any, default: Quat) -> Quat:
     return (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
 
 def build_rig_from_mdl_nodes(nodes_by_id) -> Rig:
-    """
-    Viewer-only: treat *all* MDL nodes as rig nodes so parent chains work
-    even when parents are Helpers/Attachments/etc.
-
-    The evaluator only cares about:
-      - object_id
-      - parent_id
-      - pivot
-    """
     bones: dict[int, BoneDef] = {}
     children: dict[int, list[int]] = {}
 
-    # Build BoneDef for every node (not just Bone blocks)
-    for oid, n in nodes_by_id.items():
-        pid = n.parent_id
+    # normalize ids to int to avoid string/int mismatches
+    for oid_raw, n in nodes_by_id.items():
+        oid = int(oid_raw)
+        pid = int(n.parent_id) if n.parent_id is not None else None
+
         bones[oid] = BoneDef(
-            object_id=int(oid),
-            parent_id=int(pid) if pid is not None else None,
-            name=str(n.name),
+            name=f"{n.type}:{n.name}",
+            object_id=oid,
+            parent_id=pid,
             pivot=(float(n.pivot[0]), float(n.pivot[1]), float(n.pivot[2])),
         )
-        if pid is not None and int(pid) in nodes_by_id:
-            children.setdefault(int(pid), []).append(int(oid))
 
-    # Stable ordering (helps reproducibility + debugging)
+        if pid is not None:
+            children.setdefault(pid, []).append(oid)
+
+    # stable ordering
     for k in list(children.keys()):
         children[k].sort()
 
-    # Roots: anything whose parent is missing or None
+    # infer roots
     if bones:
         all_ids = set(bones.keys())
         child_ids = {cid for kids in children.values() for cid in kids}
@@ -230,7 +224,7 @@ class UnitAnimEvaluator:
             m = mat4_mul(mat4_translate(pivot), mat4_translate(trans))
             m = mat4_mul(m, mat4_from_quat(rot))
             m = mat4_mul(m, mat4_scale(scale))
-            local[oid] = m
+            m = mat4_mul(m, mat4_translate((-pivot[0], -pivot[1], -pivot[2])))
             local[oid] = m
 
         # World resolve: forest roots
