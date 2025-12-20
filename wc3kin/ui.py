@@ -48,6 +48,19 @@ class App(tk.Tk):
         self.con = connect(self.cfg.db_path)
         init_db(self.con)
 
+        #run any local db commands as needed
+        query_path = Path("query.txt")
+        if query_path.is_file():
+            try:
+                sql = query_path.read_text(encoding="utf-8").strip()
+                print(f'Executing SQL:{sql}')
+                if sql:
+                    self.con.executescript(sql)
+                    self.con.commit()
+                    self.logger.info("Executed startup query from query.txt")
+            except Exception as e:
+                self.logger.exception("Failed to execute query.txt on startup")
+
         # UI state
         self.race_var = tk.StringVar(value="")
         self.unit_var = tk.StringVar(value="")

@@ -1,0 +1,1 @@
+DELETE FROM animations WHERE unit_id = (SELECT id FROM units WHERE unit_name='Archnathid');

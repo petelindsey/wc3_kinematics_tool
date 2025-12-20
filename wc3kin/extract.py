@@ -29,6 +29,12 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+
+def _is_junk_action_name(name: str) -> bool:
+    # Some FBXs include helper Actions (eg Range_Nodes) that are not real unit animations.
+    n = name.lower()
+    return "range_nodes" in n or n.endswith("range_nodes") or "rang_nodes" in n
+
 def _project_script(project_root: Path, rel: str) -> Path:
     return (project_root / rel).resolve()
 
@@ -116,42 +122,6 @@ def _run_extract_once(
         return json.loads(out_json.read_text()), p
 
 
-
-def _find_per_action_anim_dir(model_for_extract: Path) -> Path | None:
-    """
-    Find the per-action animation directory for a cached FBX.
-
-    Expected: <cache_dir>/<Unit>_anims/
-    But on Windows / manual copying, casing can differ, so we match case-insensitively.
-    Also supports a heuristic fallback: any *_anims dir that contains FBXs starting with '<Unit>_'.
-    """
-    cache_dir = model_for_extract.parent
-    unit_stem = model_for_extract.stem
-    expected_name = f"{unit_stem}_anims"
-
-    # 1) Exact expected path
-    expected = cache_dir / expected_name
-    if expected.is_dir():
-        return expected
-
-    # 2) Case-insensitive directory name match in cache_dir
-    for p in cache_dir.iterdir():
-        if p.is_dir() and p.name.lower() == expected_name.lower():
-            return p
-
-    # 3) Heuristic: pick the *_anims dir with the most FBXs that look like '<Unit>_<Clip>.fbx'
-    best_dir: Path | None = None
-    best_count = 0
-    for p in cache_dir.iterdir():
-        if not p.is_dir() or not p.name.lower().endswith("_anims"):
-            continue
-        fbxs = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() == ".fbx"]
-        count = sum(1 for f in fbxs if f.stem.lower().startswith(unit_stem.lower() + "_"))
-        if count > best_count:
-            best_count = count
-            best_dir = p
-
-    return best_dir
 def run_blender_extract(
     blender_path: Path,
     project_root: Path,
@@ -183,32 +153,34 @@ def run_blender_extract(
     error = base_data.get("error")
 
     # 2) Extract animations from per-action FBXs
-    # 2) Extract animations from per-action FBXs
-    model_for_extract_path = Path(model_for_extract)
-    anim_dir = _find_per_action_anim_dir(model_for_extract_path)
+    anim_dir = Path(model_for_extract).parent / f"{Path(model_for_extract).stem}_anims"
     animations: list[str] = []
     animations_source = "original"
 
-    if anim_dir and anim_dir.is_dir():
+    if anim_dir.is_dir():
         animations_source = "per_action"
-        # enumerate FBXs case-insensitively (handles .FBX)
-        fbxs = sorted([p for p in anim_dir.iterdir() if p.is_file() and p.suffix.lower() == ".fbx"], key=lambda p: p.name.lower())
-        for fbx in fbxs:
+        for fbx in sorted(anim_dir.glob("*.fbx")):
             try:
                 clip_data, _ = _run_extract_once(blender_path, blender_script, fbx)
-                clip_anims = clip_data.get("animations") or []
+                clip_anims = list(clip_data.get("animations") or [])
+                # Filter out non-animation helper actions that often appear in these exports
+                clip_anims = [a for a in clip_anims if not _is_junk_action_name(str(a))]
                 if clip_anims:
-                    animations.extend(clip_anims)
+                    animations.extend([str(a) for a in clip_anims])
                 else:
-                    animations.append(fbx.stem.replace(model_for_extract_path.stem + "_", ""))
+                    # Deterministic fallback: derive clip name from filename <Unit>_<Clip>.fbx -> <Clip>
+                    unit_stem = Path(model_for_extract).stem
+                    stem = fbx.stem
+                    prefix = unit_stem + "_"
+                    animations.append(stem[len(prefix):] if stem.startswith(prefix) else stem)
             except Exception as e:
                 warnings.append(f"{fbx.name}: {e!r}")
 
     else:
-        # Legacy: animations embedded in the base FBX (may include helper actions like Range_Nodes).
         animations = list(base_data.get("animations") or [])
-        if anim_dir is None:
-            warnings.append(f"No per-action anim directory found for {model_for_extract_path.name}; using base FBX animations.")
+
+    animations = sorted(set(animations), key=str.lower)
+
     return ExtractResult(
         ok=bool(base_data.get("ok")),
         armature_name=armature_name,
