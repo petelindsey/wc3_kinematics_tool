@@ -25,6 +25,169 @@ class UnitRow:
     last_scanned: str
 
 
+# --- NEW DB HELPERS (add near other helpers) ---
+def get_bone_stats_for_sequence(con: sqlite3.Connection, unit_id: int, sequence_id: int) -> list[sqlite3.Row]:
+    cur = con.execute(
+        """
+        SELECT
+          bms.bone_object_id AS bone_object_id,
+          COALESCE(b.name, '') AS bone_name,
+          bms.trans_rms_vel,
+          bms.rot_ang_range_rad,
+          bms.rot_rms_ang_vel
+        FROM bone_motion_stats bms
+        LEFT JOIN bones b
+          ON b.unit_id = bms.unit_id
+         AND b.object_id = bms.bone_object_id
+        WHERE bms.unit_id = ?
+          AND bms.sequence_id = ?
+        ;
+        """,
+        (unit_id, sequence_id),
+    )
+    return list(cur.fetchall())
+
+def upsert_sequence_fingerprint(
+    con: sqlite3.Connection,
+    unit_id: int,
+    sequence_id: int,
+    fingerprint_json: str,
+    fingerprint_sha1: str,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO sequence_fingerprints (unit_id, sequence_id, fingerprint_json, fingerprint_sha1)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(unit_id, sequence_id) DO UPDATE SET
+          fingerprint_json = excluded.fingerprint_json,
+          fingerprint_sha1 = excluded.fingerprint_sha1
+        ;
+        """,
+        (unit_id, sequence_id, fingerprint_json, fingerprint_sha1),
+    )
+    con.commit()
+
+def get_harvested_json_text(con: sqlite3.Connection, unit_id: int, kind: str) -> Optional[str]:
+    cur = con.execute(
+        "SELECT json_text FROM harvested_json WHERE unit_id = ? AND kind = ?;",
+        (unit_id, kind),
+    )
+    row = cur.fetchone()
+    return str(row["json_text"]) if row else None
+
+
+def get_sequences_rows_for_unit(
+    con: sqlite3.Connection,
+    unit_id: int,
+    *,
+    include_death_and_corpse: bool = False,
+) -> list[sqlite3.Row]:
+    if include_death_and_corpse:
+        cur = con.execute(
+            "SELECT id, name, start, end, is_death, is_corpse FROM sequences WHERE unit_id = ? ORDER BY name;",
+            (unit_id,),
+        )
+    else:
+        cur = con.execute(
+            """
+            SELECT id, name, start, end, is_death, is_corpse
+            FROM sequences
+            WHERE unit_id = ?
+              AND is_death = 0
+              AND is_corpse = 0
+            ORDER BY name;
+            """,
+            (unit_id,),
+        )
+    return list(cur.fetchall())
+
+
+def upsert_bones_by_object_id(con: sqlite3.Connection, rows: list[tuple]) -> int:
+    """
+    rows: (unit_id, name, object_id, parent_object_id, pivot_x, pivot_y, pivot_z, depth, path)
+    Requires UNIQUE(unit_id, object_id) to exist (or a unique index).
+    """
+    cur = con.cursor()
+    cur.executemany(
+        """
+        INSERT INTO bones (unit_id, name, object_id, parent_object_id, pivot_x, pivot_y, pivot_z, depth, path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(unit_id, object_id) DO UPDATE SET
+          name=excluded.name,
+          parent_object_id=excluded.parent_object_id,
+          pivot_x=excluded.pivot_x,
+          pivot_y=excluded.pivot_y,
+          pivot_z=excluded.pivot_z,
+          depth=excluded.depth,
+          path=excluded.path
+        ;
+        """,
+        rows,
+    )
+    con.commit()
+    return cur.rowcount
+
+
+def upsert_bone_motion_stats(con: sqlite3.Connection, rows: list[tuple]) -> int:
+    """
+    rows match bone_motion_stats columns exactly
+    """
+    cur = con.cursor()
+    cur.executemany(
+        """
+        INSERT INTO bone_motion_stats (
+          unit_id, sequence_id, bone_object_id,
+          tx_min, tx_max, ty_min, ty_max, tz_min, tz_max,
+          tmag_min, tmag_max,
+          trans_rms_vel,
+          rot_ang_range_rad, rot_rms_ang_vel,
+          sx_min, sx_max, sy_min, sy_max, sz_min, sz_max,
+          slice_start_ms, slice_end_ms, sample_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(unit_id, sequence_id, bone_object_id) DO UPDATE SET
+          tx_min=excluded.tx_min, tx_max=excluded.tx_max,
+          ty_min=excluded.ty_min, ty_max=excluded.ty_max,
+          tz_min=excluded.tz_min, tz_max=excluded.tz_max,
+          tmag_min=excluded.tmag_min, tmag_max=excluded.tmag_max,
+          trans_rms_vel=excluded.trans_rms_vel,
+          rot_ang_range_rad=excluded.rot_ang_range_rad,
+          rot_rms_ang_vel=excluded.rot_rms_ang_vel,
+          sx_min=excluded.sx_min, sx_max=excluded.sx_max,
+          sy_min=excluded.sy_min, sy_max=excluded.sy_max,
+          sz_min=excluded.sz_min, sz_max=excluded.sz_max,
+          slice_start_ms=excluded.slice_start_ms,
+          slice_end_ms=excluded.slice_end_ms,
+          sample_count=excluded.sample_count
+        ;
+        """,
+        rows,
+    )
+    con.commit()
+    return cur.rowcount
+
+
+def upsert_sequence_motion_stats(con: sqlite3.Connection, rows: list[tuple]) -> int:
+    cur = con.cursor()
+    cur.executemany(
+        """
+        INSERT INTO sequence_motion_stats (
+          unit_id, sequence_id,
+          active_bone_count, total_trans_rms, total_rot_rms
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(unit_id, sequence_id) DO UPDATE SET
+          active_bone_count=excluded.active_bone_count,
+          total_trans_rms=excluded.total_trans_rms,
+          total_rot_rms=excluded.total_rot_rms
+        ;
+        """,
+        rows,
+    )
+    con.commit()
+    return cur.rowcount
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(db_path))

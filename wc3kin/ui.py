@@ -6,6 +6,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 import sqlite3
+import json
 
 from .config import load_config
 from .db import (
@@ -21,6 +22,7 @@ from .db import (
 )
 from .extract import run_blender_extract, ingest_extract_to_db
 from .scanner import scan_units, to_db_rows
+from .kinematics import compute_motion_stats_for_unit
 
 
 def _setup_logger(log_path: Path) -> logging.Logger:
@@ -79,7 +81,17 @@ class App(tk.Tk):
             label="Ingest Sequences (All Units)",
             command=lambda: self._menu_ingest_sequences_all(only_selected_race=False),
         )
-
+        ingest_menu.add_separator()
+        ingest_menu.add_command(label="Compute Motion Stats (Selected)", command=self._menu_motion_selected)
+        ingest_menu.add_command(
+            label="Compute Motion Stats (This Race)",
+            command=lambda: self._menu_motion_all(only_selected_race=True),
+        )
+        ingest_menu.add_command(
+            label="Compute Motion Stats (All Units)",
+            command=lambda: self._menu_motion_all(only_selected_race=False),
+        )
+        ingest_menu.add_separator()
         menubar.add_cascade(label="Ingest", menu=ingest_menu)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
@@ -167,11 +179,62 @@ class App(tk.Tk):
 
         sql_btn_row = ttk.Frame(self.sql_frame)
         sql_btn_row.pack(fill="x", padx=8, pady=(0, 4))
+
         ttk.Button(sql_btn_row, text="Run", command=self._run_sql).pack(side="left")
+        ttk.Button(sql_btn_row, text="Clear", command=self._clear_sql_console).pack(side="left", padx=(8, 0))
+        ttk.Button(sql_btn_row, text="Copy JSON", command=self._copy_sql_output_json).pack(side="left", padx=(8, 0))
         ttk.Button(sql_btn_row, text="Close", command=self._toggle_sql_console).pack(side="left", padx=(8, 0))
 
         self.sql_output = tk.Text(self.sql_frame, height=8, wrap="word")
         self.sql_output.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        self.sql_last_headers: list[str] = []
+        self.sql_last_rows: list[dict[str, object]] = []
+
+    def _copy_sql_output_json(self) -> None:
+        import json
+
+        if not self.sql_last_headers:
+            # No captured result-set; fall back to copying the raw text output
+            txt = self.sql_output.get("1.0", "end").strip()
+            if not txt:
+                return
+            self.clipboard_clear()
+            self.clipboard_append(json.dumps({"text": txt}, ensure_ascii=False, indent=2))
+            return
+
+        payload = {
+            "columns": self.sql_last_headers,
+            "rows": self.sql_last_rows,
+            "row_count": len(self.sql_last_rows),
+        }
+        self.clipboard_clear()
+        self.clipboard_append(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def _split_sql_statements(self,script: str) -> list[str]:
+        """
+        Split SQL script into complete statements using sqlite3.complete_statement.
+        Handles semicolons inside strings better than naive split(';').
+        """
+        import sqlite3
+
+        stmts: list[str] = []
+        buf: list[str] = []
+        for line in script.splitlines():
+            buf.append(line)
+            joined = "\n".join(buf).strip()
+            if joined and sqlite3.complete_statement(joined):
+                stmts.append(joined)
+                buf = []
+        tail = "\n".join(buf).strip()
+        if tail:
+            stmts.append(tail)
+        return [s.strip() for s in stmts if s.strip()]
+
+    def _clear_sql_console(self) -> None:
+        self.sql_query.delete("1.0", "end")
+        self.sql_output.delete("1.0", "end")
+        self.sql_last_headers = []
+        self.sql_last_rows = []
 
     def _set_status(self, s: str) -> None:
         self.status_var.set(s)
@@ -265,6 +328,106 @@ class App(tk.Tk):
             return
 
         self._ingest_unit_id(uid)
+
+    def _copy_sql_output_json(self) -> None:
+        import json
+
+        if not self.sql_last_headers:
+            # No captured result-set; fall back to copying the raw text output
+            txt = self.sql_output.get("1.0", "end").strip()
+            if not txt:
+                return
+            self.clipboard_clear()
+            self.clipboard_append(json.dumps({"text": txt}, ensure_ascii=False, indent=2))
+            return
+
+        payload = {
+            "columns": self.sql_last_headers,
+            "rows": self.sql_last_rows,
+            "row_count": len(self.sql_last_rows),
+        }
+        self.clipboard_clear()
+        self.clipboard_append(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def _menu_motion_selected(self) -> None:
+        unit_name = self.unit_var.get().strip()
+        uid = self.unit_id_by_name.get(unit_name)
+        if not uid:
+            self._write_info("Motion stats failed: no unit selected.", append=True)
+            self._set_status("Motion stats failed.")
+            return
+        self._motion_unit_id(uid)
+
+    def _menu_motion_all(self, *, only_selected_race: bool) -> None:
+        if only_selected_race and self.race_var.get().strip():
+            race = self.race_var.get().strip()
+            cur = self.con.execute("SELECT id FROM units WHERE race = ? ORDER BY race, unit_name;", (race,))
+        else:
+            cur = self.con.execute("SELECT id FROM units ORDER BY race, unit_name;")
+
+        ids = [int(r["id"]) for r in cur.fetchall()]
+        if not ids:
+            self._write_info("No units in DB. Run Import / Rescan Units first.", append=True)
+            return
+
+        self._write_info(f"Starting motion stats for {len(ids)} unit(s)...", append=True)
+        ok = 0
+        failed = 0
+        for i, uid in enumerate(ids, start=1):
+            self._set_status(f"Motion stats {i}/{len(ids)} ...")
+            if self._motion_unit_id(uid):
+                ok += 1
+            else:
+                failed += 1
+        self._set_status(f"Motion stats done. OK={ok}, Failed={failed}")
+        self._write_info(f"Motion stats done. OK={ok}, Failed={failed}", append=True)
+
+    def _motion_unit_id(self, uid: int) -> bool:
+        detail = get_unit_detail(self.con, uid)
+        if not detail:
+            self._write_info(f"Motion stats failed: missing unit detail for id={uid}", append=True)
+            return False
+
+        model_abspath = (self.cfg.units_root / detail.primary_model_path).resolve()
+
+        try:
+            self._set_status(f"Computing motion stats (JSON only): {detail.unit_name} ...")
+            res = compute_motion_stats_for_unit(
+                self.con,
+                uid,
+                model_abspath,
+                include_death_and_corpse=bool(self.show_death_var.get()),
+            )
+            self._write_info(
+                f"Motion stats OK: {detail.unit_name}\n"
+                f"  Bones upserted: {res.bones_upserted}\n"
+                f"  Bone motion rows upserted: {res.motion_rows_upserted}\n"
+                f"  Sequence agg rows upserted: {res.seq_rows_upserted}\n",
+                append=True,
+            )
+            self._set_status(f"Motion stats OK: {detail.unit_name}")
+            return True
+        except HarvestJsonError as e:
+            self._write_info(
+                f"Motion stats failed for {detail.unit_name}\n"
+                f"Model: {model_abspath}\n"
+                f"Error: {e}\n",
+                append=True,
+            )
+            self._set_status("Motion stats failed.")
+            return False
+        except Exception as e:
+            self.logger.exception("Motion stats exception")
+            self._write_info(
+                f"Motion stats exception for {detail.unit_name}\n"
+                f"Model: {model_abspath}\n"
+                f"{repr(e)}\n\n{traceback.format_exc()}",
+                append=True,
+            )
+            self._set_status("Motion stats exception.")
+            return False
+        finally:
+            self._on_unit_changed()
 
     def _menu_ingest_sequences_selected(self) -> None:
         """Ingest sequences for the selected unit.
@@ -501,33 +664,55 @@ class App(tk.Tk):
             self.geometry(self.SQL_GEOM)
 
     def _run_sql(self) -> None:
-        sql = self.sql_query.get("1.0", "end").strip()
+
+
+        script = self.sql_query.get("1.0", "end").strip()
         self.sql_output.delete("1.0", "end")
-        if not sql:
+        self.sql_last_headers = []
+        self.sql_last_rows = []
+
+        if not script:
             self.sql_output.insert("end", "No SQL provided.\n")
             return
 
         try:
-            first = sql.lstrip().split(None, 1)[0].lower() if sql.lstrip() else ""
-            if first in {"select", "pragma", "with"}:
-                cur = self.con.execute(sql)
-                rows = cur.fetchall()
-                headers = [d[0] for d in cur.description] if cur.description else []
-                if headers:
-                    self.sql_output.insert("end", "\t".join(headers) + "\n")
-                    self.sql_output.insert("end", "-" * 80 + "\n")
-                for r in rows:
-                    self.sql_output.insert("end", "\t".join(str(r[h]) for h in headers) + "\n")
-                self.sql_output.insert("end", f"\nRows: {len(rows)}\n")
-            else:
-                self.con.executescript(sql)
-                self.con.commit()
-                self.sql_output.insert("end", "OK (statement executed and committed)\n")
+            stmts = self._split_sql_statements(script)
+
+            total_selects = 0
+            for i, sql in enumerate(stmts, start=1):
+                first = sql.lstrip().split(None, 1)[0].lower() if sql.lstrip() else ""
+                self.sql_output.insert("end", f"-- [{i}/{len(stmts)}] {first.upper()} --\n")
+
+                if first in {"select", "pragma", "with"}:
+                    cur = self.con.execute(sql)
+                    rows = cur.fetchall()
+                    headers = [d[0] for d in cur.description] if cur.description else []
+
+                    # Print table
+                    if headers:
+                        self.sql_output.insert("end", "\t".join(headers) + "\n")
+                        self.sql_output.insert("end", "-" * 80 + "\n")
+                        for r in rows:
+                            self.sql_output.insert("end", "\t".join(str(r[h]) for h in headers) + "\n")
+                    self.sql_output.insert("end", f"Rows: {len(rows)}\n\n")
+
+                    # Save the most recent SELECT result for Copy JSON
+                    total_selects += 1
+                    self.sql_last_headers = headers
+                    self.sql_last_rows = [{h: r[h] for h in headers} for r in rows]
+
+                else:
+                    self.con.execute(sql)
+                    self.con.commit()
+                    self.sql_output.insert("end", "OK (executed and committed)\n\n")
+
+            if total_selects == 0:
+                self.sql_output.insert("end", "Done. (No result-set statements)\n")
+
         except sqlite3.Error as e:
             self.sql_output.insert("end", f"SQLite error: {e!r}\n")
         except Exception as e:
             self.sql_output.insert("end", f"Error: {e!r}\n")
-
 
 def run_app() -> None:
     here = Path(__file__).resolve().parent.parent
