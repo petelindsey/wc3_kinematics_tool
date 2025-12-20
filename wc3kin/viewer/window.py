@@ -173,7 +173,7 @@ class ViewerWindow(tk.Toplevel):
         if self._evaluator is None or self._rig is None:
             return
         #pose = self._evaluator.evaluate_pose(self.t_ms)
-        t_sample = self.t_ms - getattr(self, "_time_offset", 0)
+        t_sample = self.t_ms - int(self.seq.start_ms) if self.seq is not None else self.t_ms
         pose = self._evaluator.evaluate_pose(t_sample)
         if not hasattr(self, "_fit_done"):
             xs = [p[0] for p in pose.world_pos.values()]
