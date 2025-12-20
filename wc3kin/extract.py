@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
+import sqlite3
 
 
 @dataclass(frozen=True)
@@ -76,16 +76,7 @@ def ensure_fbx_for_wc3_model(
     if texture_root:
         cmd += ["--texture-root", str(texture_root)]
 
-    if logger:
-        logger.info("Running WC3->FBX export: %s", " ".join(cmd))
-
     p = subprocess.run(cmd, capture_output=True, text=True)
-
-    if logger:
-        if p.stdout.strip():
-            logger.info("WC3 export stdout:\n%s", p.stdout.strip())
-        if p.stderr.strip():
-            logger.warning("WC3 export stderr:\n%s", p.stderr.strip())
 
     if not out_fbx.exists():
         raise RuntimeError(f"WC3 conversion failed:\n{p.stderr}")
@@ -101,9 +92,7 @@ def _run_extract_once(
     blender_path: Path,
     blender_script: Path,
     input_fbx: Path,
-    logger=None,
-) -> Tuple[dict, subprocess.CompletedProcess[str]]:
-    """Run the Blender extractor script on a single FBX and return (json, process)."""
+) -> tuple[dict, subprocess.CompletedProcess[str]]:
     with tempfile.TemporaryDirectory(prefix="wc3kin_") as td:
         out_json = Path(td) / "extract.json"
 
@@ -119,48 +108,50 @@ def _run_extract_once(
             str(out_json),
         ]
 
-        if logger:
-            logger.info("Running Blender extract: %s", " ".join(cmd))
-
         p = subprocess.run(cmd, capture_output=True, text=True)
 
-        if logger:
-            if p.stdout.strip():
-                logger.info("Blender stdout:\n%s", p.stdout.strip())
-            if p.stderr.strip():
-                logger.warning("Blender stderr:\n%s", p.stderr.strip())
-
         if not out_json.exists():
-            raise RuntimeError(
-                "Extractor did not produce output JSON.\n"
-                f"Input: {input_fbx}\n"
-                f"Command: {' '.join(cmd)}\n\n"
-                f"stdout:\n{p.stdout}\n\n"
-                f"stderr:\n{p.stderr}"
-            )
+            raise RuntimeError(f"Extractor failed:\n{p.stderr}")
 
-        return json.loads(out_json.read_text(encoding="utf-8")), p
+        return json.loads(out_json.read_text()), p
 
 
-def _list_fbx_files(dir_path: Path) -> List[Path]:
-    """List FBX files case-insensitively (handles .fbx / .FBX)."""
-    if not dir_path.is_dir():
-        return []
-    return sorted(
-        [p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() == ".fbx"],
-        key=lambda p: p.name.lower(),
-    )
 
+def _find_per_action_anim_dir(model_for_extract: Path) -> Path | None:
+    """
+    Find the per-action animation directory for a cached FBX.
 
-def _derive_anim_name_from_filename(unit_stem: str, anim_fbx: Path) -> str:
-    """Derive <Action> from <Unit>_<Action>.fbx, else fallback to full stem."""
-    stem = anim_fbx.stem
-    prefix = unit_stem + "_"
-    if stem.startswith(prefix) and len(stem) > len(prefix):
-        return stem[len(prefix):]
-    return stem
+    Expected: <cache_dir>/<Unit>_anims/
+    But on Windows / manual copying, casing can differ, so we match case-insensitively.
+    Also supports a heuristic fallback: any *_anims dir that contains FBXs starting with '<Unit>_'.
+    """
+    cache_dir = model_for_extract.parent
+    unit_stem = model_for_extract.stem
+    expected_name = f"{unit_stem}_anims"
 
+    # 1) Exact expected path
+    expected = cache_dir / expected_name
+    if expected.is_dir():
+        return expected
 
+    # 2) Case-insensitive directory name match in cache_dir
+    for p in cache_dir.iterdir():
+        if p.is_dir() and p.name.lower() == expected_name.lower():
+            return p
+
+    # 3) Heuristic: pick the *_anims dir with the most FBXs that look like '<Unit>_<Clip>.fbx'
+    best_dir: Path | None = None
+    best_count = 0
+    for p in cache_dir.iterdir():
+        if not p.is_dir() or not p.name.lower().endswith("_anims"):
+            continue
+        fbxs = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() == ".fbx"]
+        count = sum(1 for f in fbxs if f.stem.lower().startswith(unit_stem.lower() + "_"))
+        if count > best_count:
+            best_count = count
+            best_dir = p
+
+    return best_dir
 def run_blender_extract(
     blender_path: Path,
     project_root: Path,
@@ -169,6 +160,7 @@ def run_blender_extract(
     texture_root: Optional[Path] = None,
     logger=None,
 ) -> ExtractResult:
+
     model_for_extract = ensure_fbx_for_wc3_model(
         blender_path,
         project_root,
@@ -181,73 +173,42 @@ def run_blender_extract(
     blender_script = pick_extractor_script(project_root)
 
     # 1) Extract bones from base FBX
-    base_fbx = Path(model_for_extract)
-    base_data, base_proc = _run_extract_once(blender_path, blender_script, base_fbx, logger=logger)
+    base_data, base_proc = _run_extract_once(
+        blender_path, blender_script, Path(model_for_extract)
+    )
 
     bones = list(base_data.get("bones") or [])
     armature_name = base_data.get("armature_name")
     warnings = list(base_data.get("warnings") or [])
     error = base_data.get("error")
 
-    # 2) Extract animations from per-action FBXs, if present.
-    #
-    # Primary expected location:
-    #   <base_fbx.parent>/<base_fbx.stem>_anims/*.fbx
-    # Fallback (handles cases where base stem differs from original model stem):
-    #   <project_root>/_cache_fbx/<model_abspath.stem>_anims/*.fbx
-    expected_anim_dir = base_fbx.parent / f"{base_fbx.stem}_anims"
-    fallback_anim_dir = _project_script(project_root, "_cache_fbx") / f"{model_abspath.stem}_anims"
-
-    anim_dir = expected_anim_dir if expected_anim_dir.is_dir() else fallback_anim_dir
-
-    animations: List[str] = []
+    # 2) Extract animations from per-action FBXs
+    # 2) Extract animations from per-action FBXs
+    model_for_extract_path = Path(model_for_extract)
+    anim_dir = _find_per_action_anim_dir(model_for_extract_path)
+    animations: list[str] = []
     animations_source = "original"
 
-    if logger:
-        logger.info("Base FBX: %s", base_fbx)
-        logger.info("Expected anim dir: %s (exists=%s)", expected_anim_dir, expected_anim_dir.is_dir())
-        logger.info("Fallback anim dir: %s (exists=%s)", fallback_anim_dir, fallback_anim_dir.is_dir())
-        logger.info("Using anim dir: %s (exists=%s)", anim_dir, anim_dir.is_dir())
-
-    per_action_fbxs = _list_fbx_files(anim_dir)
-
-    if per_action_fbxs:
+    if anim_dir and anim_dir.is_dir():
         animations_source = "per_action"
-        unit_stem = base_fbx.stem
-
-        if logger:
-            logger.info("Per-action FBXs found: %d", len(per_action_fbxs))
-            for f in per_action_fbxs:
-                logger.info("  anim fbx: %s", f)
-
-        for fbx in per_action_fbxs:
+        # enumerate FBXs case-insensitively (handles .FBX)
+        fbxs = sorted([p for p in anim_dir.iterdir() if p.is_file() and p.suffix.lower() == ".fbx"], key=lambda p: p.name.lower())
+        for fbx in fbxs:
             try:
-                clip_data, _ = _run_extract_once(blender_path, blender_script, fbx, logger=logger)
-                clip_anims = list(clip_data.get("animations") or [])
-
+                clip_data, _ = _run_extract_once(blender_path, blender_script, fbx)
+                clip_anims = clip_data.get("animations") or []
                 if clip_anims:
                     animations.extend(clip_anims)
                 else:
-                    # Deterministic fallback if extractor didn't register an Action
-                    animations.append(_derive_anim_name_from_filename(unit_stem, fbx))
-
-                for w in list(clip_data.get("warnings") or []):
-                    warnings.append(f"{fbx.name}: {w}")
-
-                if clip_data.get("error"):
-                    warnings.append(f"{fbx.name}: {clip_data.get('error')}")
+                    animations.append(fbx.stem.replace(model_for_extract_path.stem + "_", ""))
             except Exception as e:
                 warnings.append(f"{fbx.name}: {e!r}")
+
     else:
-        # Legacy: animations embedded in the base FBX.
-        # Note: this can include helper actions like Range_Nodes; per-action mode avoids that.
+        # Legacy: animations embedded in the base FBX (may include helper actions like Range_Nodes).
         animations = list(base_data.get("animations") or [])
-
-        if logger:
-            logger.info("No per-action FBXs found; using base FBX animations (%d).", len(animations))
-
-    animations = sorted(set(animations), key=str.lower)
-
+        if anim_dir is None:
+            warnings.append(f"No per-action anim directory found for {model_for_extract_path.name}; using base FBX animations.")
     return ExtractResult(
         ok=bool(base_data.get("ok")),
         armature_name=armature_name,
@@ -279,7 +240,7 @@ def ingest_extract_to_db(con: sqlite3.Connection, unit_id: int, extracted: Extra
             INSERT OR IGNORE INTO animations (unit_id, name, source, created_at)
             VALUES (?, ?, ?, ?);
             """,
-            [(unit_id, a, extracted.animations_source or "original", now) for a in extracted.animations],
+            [(unit_id, a, extracted.animations_source, now) for a in extracted.animations],
         )
 
     con.commit()
