@@ -142,4 +142,18 @@ class ViewerWindow(tk.Toplevel):
             return
         pose = self._evaluator.evaluate_pose(self.t_ms)
         self.gl.set_pose(pose, self._rig, active_ids=None)
+        if not hasattr(self, "_fit_done"):
+            xs = [p[0] for p in pose.world_pos.values()]
+            ys = [p[1] for p in pose.world_pos.values()]
+            zs = [p[2] for p in pose.world_pos.values()]
+
+            if xs:
+                span = max(
+                    max(xs) - min(xs),
+                    max(ys) - min(ys),
+                    max(zs) - min(zs),
+                )
+                self.gl._impl._ortho_scale = max(span * 0.75, 100.0)
+
+            self._fit_done = True
         self.time_lbl.config(text=f"t={self.t_ms}ms")

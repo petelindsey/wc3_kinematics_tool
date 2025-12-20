@@ -162,4 +162,12 @@ class GLViewerFrame(tk.Frame):
         self._impl._pose = pose
         self._impl._rig = rig
         self._impl._active_ids = active_ids
+        print(
+            "POSE:",
+            len(pose.world_pos),
+            "bones;",
+            "min/max:",
+            min(pose.world_pos.values()),
+            max(pose.world_pos.values()),
+        )
         self._impl.request_redraw()

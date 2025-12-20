@@ -87,7 +87,7 @@ def build_rig_from_bones_json(data: dict[str, Any]) -> Rig:
 
     for b in bones_arr:
         oid = int(b.get("object_id"))
-        pid_raw = b.get("parent_id")
+        pid_raw = b.get("parent_id", b.get("parent_object_id"))
         pid = int(pid_raw) if pid_raw is not None else None
         name = str(b.get("name") or f"bone_{oid}")
         piv = b.get("pivot") or [0.0, 0.0, 0.0]
@@ -211,6 +211,8 @@ class UnitAnimEvaluator:
         # transform the pivot by world matrix (this matches pivot usage)
         for oid in bone_ids:
             pivot = self.rig.bones[oid].pivot
-            world_pos[oid] = transform_point(world[oid], pivot)
+            
+            world_pos[oid] = transform_point(world[oid], (0.0, 0.0, 0.0))
+            
 
         return Pose(world_mats=world, world_pos=world_pos)
