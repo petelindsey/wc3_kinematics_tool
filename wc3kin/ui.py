@@ -17,6 +17,7 @@ from .db import (
     get_unit_detail,
     upsert_units,
     ingest_sequences_from_harvest_json,
+    HarvestJsonError,
 )
 from .extract import run_blender_extract, ingest_extract_to_db
 from .scanner import scan_units, to_db_rows
@@ -55,6 +56,36 @@ class App(tk.Tk):
         self.unit_var = tk.StringVar(value="")
         self.anim_var = tk.StringVar(value="")
         self.show_death_var = tk.BooleanVar(value=False)
+        self.json_only_var = tk.BooleanVar(value=True)
+
+        # menu
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
+
+        ingest_menu = tk.Menu(menubar, tearoff=0)
+        ingest_menu.add_checkbutton(
+            label="JSON Only",
+            variable=self.json_only_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        ingest_menu.add_separator()
+        ingest_menu.add_command(label="Ingest Sequences (Selected)", command=self._menu_ingest_sequences_selected)
+        ingest_menu.add_command(
+            label="Ingest Sequences (This Race)",
+            command=lambda: self._menu_ingest_sequences_all(only_selected_race=True),
+        )
+        ingest_menu.add_command(
+            label="Ingest Sequences (All Units)",
+            command=lambda: self._menu_ingest_sequences_all(only_selected_race=False),
+        )
+
+        menubar.add_cascade(label="Ingest", menu=ingest_menu)
+
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="SQL Console", command=self._toggle_sql_console)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
 
         self.unit_id_by_name: dict[str, int] = {}
 
@@ -102,6 +133,7 @@ class App(tk.Tk):
             text="Ingest All (This Race)",
             command=lambda: self._ingest_all(only_selected_race=True),
         ).pack(side="left", padx=4)
+
 
         ttk.Button(
             btns,
@@ -234,6 +266,88 @@ class App(tk.Tk):
 
         self._ingest_unit_id(uid)
 
+    def _menu_ingest_sequences_selected(self) -> None:
+        """Ingest sequences for the selected unit.
+
+        When "JSON Only" is enabled, this uses the harvested JSON fast-path and does not require Blender.
+        When disabled, it falls back to the full ingest pipeline (which may invoke Blender).
+        """
+        if self.json_only_var.get():
+            self._ingest_sequences_json_selected()
+        else:
+            # Full ingest pipeline (legacy behavior)
+            self._ingest_selected()
+
+    def _menu_ingest_sequences_all(self, *, only_selected_race: bool) -> None:
+        """Batch-ingest sequences for a race or all units, respecting the JSON-only toggle."""
+        if self.json_only_var.get():
+            self._ingest_sequences_json_all(only_selected_race=only_selected_race)
+        else:
+            self._ingest_all(only_selected_race=only_selected_race)
+
+    def _ingest_sequences_json_selected(self) -> None:
+        """Fast path: ingest canonical sequence ranges from harvested JSON only.
+
+        This does not require Blender and only touches the `sequences` table.
+        """
+        unit_name = self.unit_var.get().strip()
+        uid = self.unit_id_by_name.get(unit_name)
+        if not uid:
+            self._write_info("JSON-only sequence ingest failed: no unit selected.", append=True)
+            self._set_status("JSON-only sequence ingest failed.")
+            return
+
+        self._ingest_sequences_json_unit_id(uid)
+
+    def _ingest_sequences_json_unit_id(self, uid: int) -> bool:
+        detail = get_unit_detail(self.con, uid)
+        if not detail:
+            self._write_info(f"JSON-only sequence ingest failed: missing unit detail for id={uid}", append=True)
+            return False
+
+        model_abspath = (self.cfg.units_root / detail.primary_model_path).resolve()
+        try:
+            self._set_status(f"Ingesting sequences (JSON only): {detail.unit_name} ...")
+            upserts = ingest_sequences_from_harvest_json(self.con, uid, model_abspath)
+            if upserts <= 0:
+                self._write_info(
+                    f"JSON-only sequence ingest: no sequences upserted for {detail.unit_name}\n"
+                    f"  Expected: {model_abspath.with_name(model_abspath.stem + '_materialsets.json')}\n",
+                    append=True,
+                )
+                self._set_status(f"JSON-only sequence ingest: no sequences for {detail.unit_name}")
+                return False
+
+            self._write_info(
+                f"JSON-only sequence ingest OK: {detail.unit_name}\n"
+                f"  Sequences upserted: {upserts}\n"
+                f"  Source: {model_abspath.with_name(model_abspath.stem + '_materialsets.json')}\n",
+                append=True,
+            )
+            self._set_status(f"JSON-only sequence ingest OK: {detail.unit_name}")
+            return True
+        except HarvestJsonError as e:
+            self._write_info(
+                f"JSON-only sequence ingest failed for {detail.unit_name}\n"
+                f"Model: {model_abspath}\n"
+                f"Error: {e}\n",
+                append=True,
+            )
+            self._set_status("JSON-only sequence ingest failed.")
+            return False
+        except Exception as e:
+            self.logger.exception("JSON-only sequence ingest exception")
+            self._write_info(
+                f"JSON-only sequence ingest exception for {detail.unit_name}\n"
+                f"Model: {model_abspath}\n"
+                f"{repr(e)}\n\n{traceback.format_exc()}",
+                append=True,
+            )
+            self._set_status("JSON-only sequence ingest exception.")
+            return False
+        finally:
+            self._on_unit_changed()
+
     def _ingest_unit_id(self, uid: int) -> bool:
         detail = get_unit_detail(self.con, uid)
         if not detail:
@@ -336,6 +450,39 @@ class App(tk.Tk):
 
         self._set_status(f"Batch ingest done. OK={ok}, Failed={failed}")
         self._write_info(f"Batch ingest done. OK={ok}, Failed={failed}", append=True)
+
+    def _ingest_sequences_json_all(self, only_selected_race: bool = False) -> None:
+        """Batch JSON-only sequence ingest."""
+        if only_selected_race and self.race_var.get().strip():
+            race = self.race_var.get().strip()
+            if not race:
+                self._write_info("Select a race first.", append=True)
+                return
+            cur = self.con.execute(
+                "SELECT id FROM units WHERE race = ? ORDER BY race, unit_name;",
+                (race,),
+            )
+        else:
+            cur = self.con.execute("SELECT id FROM units ORDER BY race, unit_name;")
+
+        ids = [int(r["id"]) for r in cur.fetchall()]
+        if not ids:
+            self._write_info("No units in DB. Run Import / Rescan Units first.", append=True)
+            return
+
+        self._write_info(f"Starting JSON-only sequence ingest for {len(ids)} unit(s)...", append=True)
+
+        ok = 0
+        failed = 0
+        for i, uid in enumerate(ids, start=1):
+            self._set_status(f"Sequence ingest (JSON only) {i}/{len(ids)} ...")
+            if self._ingest_sequences_json_unit_id(uid):
+                ok += 1
+            else:
+                failed += 1
+
+        self._set_status(f"JSON-only sequence ingest done. OK={ok}, Failed={failed}")
+        self._write_info(f"JSON-only sequence ingest done. OK={ok}, Failed={failed}", append=True)
 
     # ---------------- SQL console ----------------
 

@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+class HarvestJsonError(RuntimeError):
+    """Raised when a harvested JSON file exists but cannot be parsed/used."""
 
 
 @dataclass(frozen=True)
@@ -123,6 +127,26 @@ def init_db(con: sqlite3.Connection) -> None:
           source TEXT NOT NULL DEFAULT 'harvest_json',
           created_at TEXT NOT NULL,
           UNIQUE(unit_id, name),
+          FOREIGN KEY(unit_id) REFERENCES units(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+    # schema v3: raw harvested JSON blobs (foundation for future sequence-aware kinematics)
+    #
+    # We intentionally do not parse these into normalized tables yet. The goal is to preserve
+    # the canonical harvested artifacts alongside the unit so later pipeline stages can be
+    # driven by (sequence_name, start, end) from `sequences` without re-harvesting.
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harvested_json (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          unit_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          source_path TEXT NOT NULL,
+          json_text TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(unit_id, kind),
           FOREIGN KEY(unit_id) REFERENCES units(id) ON DELETE CASCADE
         );
         """
@@ -265,7 +289,10 @@ def ingest_sequences_from_harvest_json(
         # nothing to ingest
         return 0
 
-    data = json.loads(mat_path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(mat_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HarvestJsonError(f"Failed to parse harvested JSON: {mat_path} ({e!r})") from e
     seq_ranges = data.get("sequences") or {}
     seq_cat = data.get("sequence_category") or {}
 
@@ -303,3 +330,109 @@ def ingest_sequences_from_harvest_json(
     )
     con.commit()
     return cur.rowcount
+
+
+def ingest_known_harvested_json_blobs(
+    con: sqlite3.Connection,
+    unit_id: int,
+    model_abspath: Path,
+    *,
+    include_missing: bool = False,
+) -> dict[str, int]:
+    """Best-effort ingest of raw harvested JSON files.
+
+    This is a *foundation hook* for future sequence-aware kinematics extraction.
+    It is safe to run at any time: it only touches the `harvested_json` table.
+
+    Returns a dict of kind -> rows affected (0/1).
+    """
+
+    stem = model_abspath.stem
+    candidates = {
+        "materialsets": model_abspath.with_name(f"{stem}_materialsets.json"),
+        "bones": model_abspath.with_name(f"{stem}_bones.json"),
+        "boneanims": model_abspath.with_name(f"{stem}_boneanims.json"),
+        "animslices": model_abspath.with_name(f"{stem}_animslices.json"),
+        "geosets": model_abspath.with_name(f"{stem}_geosets.json"),
+        "meshsets": model_abspath.with_name(f"{stem}_meshsets.json"),
+    }
+
+    out: dict[str, int] = {}
+    for kind, p in candidates.items():
+        if not p.is_file():
+            if include_missing:
+                out[kind] = 0
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8")
+            # Validate that it is JSON so downstream stages can assume it.
+            json.loads(txt)
+        except Exception as e:
+            raise HarvestJsonError(f"Failed to parse harvested JSON: {p} ({e!r})") from e
+        out[kind] = upsert_harvested_json_blob(con, unit_id, kind=kind, source_path=p, json_text=txt)
+    return out
+
+
+def upsert_harvested_json_blob(
+    con: sqlite3.Connection,
+    unit_id: int,
+    *,
+    kind: str,
+    source_path: Path,
+    json_text: str,
+) -> int:
+    """Store raw harvested JSON for later sequence-aware pipeline stages.
+
+    This is intentionally a "blob" store (no parsing/normalization yet).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO harvested_json (unit_id, kind, source_path, json_text, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(unit_id, kind) DO UPDATE SET
+          source_path=excluded.source_path,
+          json_text=excluded.json_text,
+          created_at=excluded.created_at
+        ;
+        """,
+        (unit_id, str(kind), str(source_path), str(json_text), now),
+    )
+    con.commit()
+    return cur.rowcount
+
+
+def ingest_harvested_json_blobs_for_unit(
+    con: sqlite3.Connection,
+    unit_id: int,
+    model_abspath: Path,
+    *,
+    kinds: Optional[list[str]] = None,
+) -> int:
+    """Ingest any additional harvested JSONs adjacent to the unit model.
+
+    Supported naming convention: <stem>_<kind>.json
+    Example kinds: bones, boneanims, animslices, geosets, meshsets, materialsets
+
+    Note: This function is a future-proofing hook and is not required for the
+    sequence-only UI ingest.
+    """
+    stem = model_abspath.stem
+    if kinds is None:
+        kinds = ["bones", "boneanims", "animslices", "geosets", "meshsets", "materialsets"]
+
+    upserts = 0
+    for kind in kinds:
+        p = model_abspath.with_name(f"{stem}_{kind}.json")
+        if not p.is_file():
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8")
+            # Ensure it's valid JSON before storing so downstream stages can trust it.
+            json.loads(txt)
+        except Exception as e:
+            raise HarvestJsonError(f"Failed to parse harvested JSON: {p} ({e!r})") from e
+        upserts += upsert_harvested_json_blob(con, unit_id, kind=kind, source_path=p, json_text=txt)
+
+    return upserts
