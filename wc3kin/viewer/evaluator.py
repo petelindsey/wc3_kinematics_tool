@@ -126,7 +126,9 @@ def build_anims_from_boneanims_json(data: dict[str, Any]) -> dict[int, BoneAnimC
     arr = data.get("bones") or []
     for b in arr:
         oid = int(b.get("object_id"))
-        ch = b.get("channels") or {}
+        ch = b.get("channels")
+        if not isinstance(ch, dict):
+            ch = b
 
         tkeys: list[KeyVec3] = []
         rkeys: list[KeyQuat] = []

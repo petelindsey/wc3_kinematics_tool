@@ -32,6 +32,7 @@ try:
         glHint,
         glDisable,
         glFlush,
+        glTranslatef,
         GL_COLOR_BUFFER_BIT,
         GL_DEPTH_BUFFER_BIT,
         GL_LINES,
@@ -106,10 +107,12 @@ class GLViewerFrame(tk.Frame):
                 # orthographic projection with auto-scale-ish; later you'll add real camera controls.
                 glMatrixMode(GL_PROJECTION)
                 glLoadIdentity()
+                glTranslatef(0.0, 0.0, -500.0)
                 aspect = float(w) / float(h)
                 # units are in wc3 coordinates; start with a generous box
                 s = getattr(self_inner, "_ortho_scale", 650.0)
-                glOrtho(-s * aspect, s * aspect, -s, s, -2000.0, 2000.0)
+                #glOrtho(-s * aspect, s * aspect, -s, s, -2000.0, 2000.0)
+                glOrtho(-s * aspect, s * aspect, -s, s, -10000.0, 10000.0)
 
                 glMatrixMode(GL_MODELVIEW)
                 glLoadIdentity()

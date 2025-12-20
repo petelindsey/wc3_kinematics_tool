@@ -125,6 +125,10 @@ class ViewerWindow(tk.Toplevel):
         # Need harvested blobs
         bones_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "bones")
         boneanims_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "boneanims")
+        print("bones_json keys:", bones_json.keys())
+        print("bones_json bones count:", len(bones_json.get("bones") or []))
+        if bones_json.get("bones"):
+            print("first bone:", bones_json["bones"][0])
         if bones_json is None or boneanims_json is None:
             raise RuntimeError(
                 "Missing harvested JSON blobs in DB.\n"
@@ -141,11 +145,25 @@ class ViewerWindow(tk.Toplevel):
         if self._evaluator is None or self._rig is None:
             return
         pose = self._evaluator.evaluate_pose(self.t_ms)
+        if not hasattr(self, "_fit_done"):
+            xs = [p[0] for p in pose.world_pos.values()]
+            ys = [p[1] for p in pose.world_pos.values()]
+            zs = [p[2] for p in pose.world_pos.values()]
+            span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+            # pad a bit
+            self.gl._impl._ortho_scale = max(span * 0.8, 100.0)
+            self._fit_done = True
         self.gl.set_pose(pose, self._rig, active_ids=None)
         if not hasattr(self, "_fit_done"):
             xs = [p[0] for p in pose.world_pos.values()]
             ys = [p[1] for p in pose.world_pos.values()]
             zs = [p[2] for p in pose.world_pos.values()]
+            print(
+                f"POSE: {len(xs)} bones; "
+                f"x[{min(xs):.2f},{max(xs):.2f}] "
+                f"y[{min(ys):.2f},{max(ys):.2f}] "
+                f"z[{min(zs):.2f},{max(zs):.2f}]"
+            )
 
             if xs:
                 span = max(
