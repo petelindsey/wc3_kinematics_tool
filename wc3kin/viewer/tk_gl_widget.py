@@ -107,7 +107,7 @@ class GLViewerFrame(tk.Frame):
                 # orthographic projection with auto-scale-ish; later you'll add real camera controls.
                 glMatrixMode(GL_PROJECTION)
                 glLoadIdentity()
-                glTranslatef(0.0, 0.0, -500.0)
+                glTranslatef(0.0, 0.0, -300.0)
                 aspect = float(w) / float(h)
                 # units are in wc3 coordinates; start with a generous box
                 s = getattr(self_inner, "_ortho_scale", 650.0)
@@ -123,7 +123,27 @@ class GLViewerFrame(tk.Frame):
                 rig: Rig = self_inner._rig
                 active_ids = getattr(self_inner, "_active_ids", None)
 
+                glLineWidth(3.0)
+                glBegin(GL_LINES)
+
+                # red horizontal
+                glColor3f(1.0, 0.0, 0.0)
+                glVertex3f(-100.0, 0.0, 0.0)
+                glVertex3f(100.0, 0.0, 0.0)
+
+                # green vertical
+                glColor3f(0.0, 1.0, 0.0)
+                glVertex3f(0.0, -100.0, 0.0)
+                glVertex3f(0.0, 100.0, 0.0)
+
+                glEnd()
+
                 glLineWidth(2.0)
+                glColor3f(1.0, 0.0, 0.0)
+                glBegin(GL_LINES)
+                glVertex3f(-100.0, 0.0, 0.0); glVertex3f(100.0, 0.0, 0.0)
+                glVertex3f(0.0, -100.0, 0.0); glVertex3f(0.0, 100.0, 0.0)
+                glEnd()
 
                 glBegin(GL_LINES)
                 for oid, b in rig.bones.items():
@@ -148,12 +168,10 @@ class GLViewerFrame(tk.Frame):
         self._impl = _Impl(self, width=640, height=480)
         self._impl.pack(fill="both", expand=True)
 
-        try:
-            self._impl.request_redraw()
-        except Exception:
-            pass
+        # IMPORTANT: let pyopengltk drive redraws properly
+        self._impl.animate = 1
 
-        # initial projection scale
+        # initial values
         self._impl._ortho_scale = 650.0
         self._impl._pose = None
         self._impl._rig = None
@@ -165,13 +183,4 @@ class GLViewerFrame(tk.Frame):
         self._impl._pose = pose
         self._impl._rig = rig
         self._impl._active_ids = active_ids
-        xs = [p[0] for p in pose.world_pos.values()]
-        ys = [p[1] for p in pose.world_pos.values()]
-        zs = [p[2] for p in pose.world_pos.values()]
-        print(
-            f"POSE: {len(xs)} bones; "
-            f"x[{min(xs):.2f},{max(xs):.2f}] "
-            f"y[{min(ys):.2f},{max(ys):.2f}] "
-            f"z[{min(zs):.2f},{max(zs):.2f}]"
-        )
-        self._impl.request_redraw()
+        # no redraw call needed; animate loop will call redraw()
