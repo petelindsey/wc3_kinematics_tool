@@ -181,6 +181,17 @@ def parse_args():
             "If omitted, all top-level actions are exported."
         ),
     )
+    parser.add_argument(
+        "--anim-manifest",
+        required=False,
+        default="",
+        help=(
+            "Optional path to write an animation manifest JSON derived from WC3 sequence metadata "
+            "(names + frame ranges). This lets downstream steps inspect/ingest animations without "
+            "requiring per-action FBX breakout."
+        ),
+    )
+
 
     parser.add_argument(
         "--drop-plane-only",
@@ -192,7 +203,7 @@ def parse_args():
     )
 
     args = parser.parse_args(argv)
-    if args.export_per_action and (not args.test) and args.out_fbx:
+    if (not args.test) and (not args.out_fbx):
         parser.error("--out-fbx is required unless --test is given")
     return args
 
@@ -342,6 +353,58 @@ def load_war3_metadata(json_root, model_name, mdx_path):
     print(f"[WC3-EXPORT] Visibility map for geosets: {list(visibility.keys())}")
 
     return bone_names, geosets, sequences, visibility
+
+
+
+def write_anim_manifest(model_name: str, sequences: dict, out_path: str):
+    """
+    Write a JSON manifest of WC3 sequences (animation names + frame ranges).
+
+    We use the geosets JSON 'sequences' mapping as the source of truth rather than
+    Blender Action names (which may include helper actions like Range_Nodes).
+    """
+    if not out_path:
+        return
+    if not sequences:
+        print("[WC3-EXPORT] No sequences available; skipping anim manifest.")
+        return
+
+    def _parse_range(v):
+        # Common shapes:
+        #   {"interval": [start, end], ...}
+        #   {"start": x, "end": y}
+        #   [start, end]
+        if isinstance(v, dict):
+            if "interval" in v and isinstance(v["interval"], (list, tuple)) and len(v["interval"]) == 2:
+                return int(v["interval"][0]), int(v["interval"][1])
+            if "start" in v and "end" in v:
+                return int(v["start"]), int(v["end"])
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            return int(v[0]), int(v[1])
+        return None, None
+
+    items = []
+    for name, meta in sequences.items():
+        start, end = _parse_range(meta)
+        items.append({
+            "name": name,
+            "start": start,
+            "end": end,
+        })
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    payload = {
+        "model": model_name,
+        "count": len(items),
+        "sequences": items,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"[WC3-EXPORT] Wrote anim manifest: {out_path} ({len(items)} sequences)")
 
 
 # ---------------------------------------------------------
@@ -966,6 +1029,11 @@ def main():
         args.json_root, args.model_name, args.mdx
     )
 
+    # Optional: write an animation manifest derived from WC3 sequence metadata.
+    # This supports downstream ingestion/inspection without per-action FBX breakout.
+    if getattr(args, "anim_manifest", "") and (not args.test):
+        write_anim_manifest(args.model_name, sequences, args.anim_manifest)
+
     # Import MDX first so images exist
     import_mdx(args.mdx, texture_root=args.texture_root)
 
@@ -1013,9 +1081,8 @@ def main():
         meshes = keep_meshes
 
     main_armature = armatures[0] if armatures else None
-
     # Per-action exports for Roblox animation import (use filtered mesh set).
-    if not args.test and args.out_fbx:
+    if args.export_per_action and (not args.test) and args.out_fbx:
         export_per_action_fbxs(
             args.model_name,
             main_armature,

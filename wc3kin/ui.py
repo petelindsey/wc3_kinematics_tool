@@ -49,7 +49,7 @@ class App(tk.Tk):
         init_db(self.con)
 
         #run any local db commands as needed
-        query_path = Path("query.txt")
+        query_path = Path("d:/wc3_kinematics_tool/query.txt")
         if query_path.is_file():
             try:
                 sql = query_path.read_text(encoding="utf-8").strip()
