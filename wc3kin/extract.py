@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
-import sqlite3
+from typing import List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -76,7 +76,16 @@ def ensure_fbx_for_wc3_model(
     if texture_root:
         cmd += ["--texture-root", str(texture_root)]
 
+    if logger:
+        logger.info("Running WC3->FBX export: %s", " ".join(cmd))
+
     p = subprocess.run(cmd, capture_output=True, text=True)
+
+    if logger:
+        if p.stdout.strip():
+            logger.info("WC3 export stdout:\n%s", p.stdout.strip())
+        if p.stderr.strip():
+            logger.warning("WC3 export stderr:\n%s", p.stderr.strip())
 
     if not out_fbx.exists():
         raise RuntimeError(f"WC3 conversion failed:\n{p.stderr}")
@@ -92,7 +101,9 @@ def _run_extract_once(
     blender_path: Path,
     blender_script: Path,
     input_fbx: Path,
-) -> tuple[dict, subprocess.CompletedProcess[str]]:
+    logger=None,
+) -> Tuple[dict, subprocess.CompletedProcess[str]]:
+    """Run the Blender extractor script on a single FBX and return (json, process)."""
     with tempfile.TemporaryDirectory(prefix="wc3kin_") as td:
         out_json = Path(td) / "extract.json"
 
@@ -108,12 +119,46 @@ def _run_extract_once(
             str(out_json),
         ]
 
+        if logger:
+            logger.info("Running Blender extract: %s", " ".join(cmd))
+
         p = subprocess.run(cmd, capture_output=True, text=True)
 
-        if not out_json.exists():
-            raise RuntimeError(f"Extractor failed:\n{p.stderr}")
+        if logger:
+            if p.stdout.strip():
+                logger.info("Blender stdout:\n%s", p.stdout.strip())
+            if p.stderr.strip():
+                logger.warning("Blender stderr:\n%s", p.stderr.strip())
 
-        return json.loads(out_json.read_text()), p
+        if not out_json.exists():
+            raise RuntimeError(
+                "Extractor did not produce output JSON.\n"
+                f"Input: {input_fbx}\n"
+                f"Command: {' '.join(cmd)}\n\n"
+                f"stdout:\n{p.stdout}\n\n"
+                f"stderr:\n{p.stderr}"
+            )
+
+        return json.loads(out_json.read_text(encoding="utf-8")), p
+
+
+def _list_fbx_files(dir_path: Path) -> List[Path]:
+    """List FBX files case-insensitively (handles .fbx / .FBX)."""
+    if not dir_path.is_dir():
+        return []
+    return sorted(
+        [p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() == ".fbx"],
+        key=lambda p: p.name.lower(),
+    )
+
+
+def _derive_anim_name_from_filename(unit_stem: str, anim_fbx: Path) -> str:
+    """Derive <Action> from <Unit>_<Action>.fbx, else fallback to full stem."""
+    stem = anim_fbx.stem
+    prefix = unit_stem + "_"
+    if stem.startswith(prefix) and len(stem) > len(prefix):
+        return stem[len(prefix):]
+    return stem
 
 
 def run_blender_extract(
@@ -124,7 +169,6 @@ def run_blender_extract(
     texture_root: Optional[Path] = None,
     logger=None,
 ) -> ExtractResult:
-
     model_for_extract = ensure_fbx_for_wc3_model(
         blender_path,
         project_root,
@@ -137,35 +181,70 @@ def run_blender_extract(
     blender_script = pick_extractor_script(project_root)
 
     # 1) Extract bones from base FBX
-    base_data, base_proc = _run_extract_once(
-        blender_path, blender_script, Path(model_for_extract)
-    )
+    base_fbx = Path(model_for_extract)
+    base_data, base_proc = _run_extract_once(blender_path, blender_script, base_fbx, logger=logger)
 
     bones = list(base_data.get("bones") or [])
     armature_name = base_data.get("armature_name")
     warnings = list(base_data.get("warnings") or [])
     error = base_data.get("error")
 
-    # 2) Extract animations from per-action FBXs
-    anim_dir = Path(model_for_extract).parent / f"{Path(model_for_extract).stem}_anims"
-    animations: list[str] = []
+    # 2) Extract animations from per-action FBXs, if present.
+    #
+    # Primary expected location:
+    #   <base_fbx.parent>/<base_fbx.stem>_anims/*.fbx
+    # Fallback (handles cases where base stem differs from original model stem):
+    #   <project_root>/_cache_fbx/<model_abspath.stem>_anims/*.fbx
+    expected_anim_dir = base_fbx.parent / f"{base_fbx.stem}_anims"
+    fallback_anim_dir = _project_script(project_root, "_cache_fbx") / f"{model_abspath.stem}_anims"
+
+    anim_dir = expected_anim_dir if expected_anim_dir.is_dir() else fallback_anim_dir
+
+    animations: List[str] = []
     animations_source = "original"
 
-    if anim_dir.is_dir():
+    if logger:
+        logger.info("Base FBX: %s", base_fbx)
+        logger.info("Expected anim dir: %s (exists=%s)", expected_anim_dir, expected_anim_dir.is_dir())
+        logger.info("Fallback anim dir: %s (exists=%s)", fallback_anim_dir, fallback_anim_dir.is_dir())
+        logger.info("Using anim dir: %s (exists=%s)", anim_dir, anim_dir.is_dir())
+
+    per_action_fbxs = _list_fbx_files(anim_dir)
+
+    if per_action_fbxs:
         animations_source = "per_action"
-        for fbx in sorted(anim_dir.glob("*.fbx")):
+        unit_stem = base_fbx.stem
+
+        if logger:
+            logger.info("Per-action FBXs found: %d", len(per_action_fbxs))
+            for f in per_action_fbxs:
+                logger.info("  anim fbx: %s", f)
+
+        for fbx in per_action_fbxs:
             try:
-                clip_data, _ = _run_extract_once(blender_path, blender_script, fbx)
-                clip_anims = clip_data.get("animations") or []
+                clip_data, _ = _run_extract_once(blender_path, blender_script, fbx, logger=logger)
+                clip_anims = list(clip_data.get("animations") or [])
+
                 if clip_anims:
                     animations.extend(clip_anims)
                 else:
-                    animations.append(fbx.stem.replace(Path(model_for_extract).stem + "_", ""))
+                    # Deterministic fallback if extractor didn't register an Action
+                    animations.append(_derive_anim_name_from_filename(unit_stem, fbx))
+
+                for w in list(clip_data.get("warnings") or []):
+                    warnings.append(f"{fbx.name}: {w}")
+
+                if clip_data.get("error"):
+                    warnings.append(f"{fbx.name}: {clip_data.get('error')}")
             except Exception as e:
                 warnings.append(f"{fbx.name}: {e!r}")
-
     else:
+        # Legacy: animations embedded in the base FBX.
+        # Note: this can include helper actions like Range_Nodes; per-action mode avoids that.
         animations = list(base_data.get("animations") or [])
+
+        if logger:
+            logger.info("No per-action FBXs found; using base FBX animations (%d).", len(animations))
 
     animations = sorted(set(animations), key=str.lower)
 
@@ -200,7 +279,7 @@ def ingest_extract_to_db(con: sqlite3.Connection, unit_id: int, extracted: Extra
             INSERT OR IGNORE INTO animations (unit_id, name, source, created_at)
             VALUES (?, ?, ?, ?);
             """,
-            [(unit_id, a, extracted.animations_source, now) for a in extracted.animations],
+            [(unit_id, a, extracted.animations_source or "original", now) for a in extracted.animations],
         )
 
     con.commit()
