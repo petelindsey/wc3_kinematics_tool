@@ -92,61 +92,52 @@ class GLViewerFrame(tk.Frame):
                     self_inner.after_idle(self_inner.redraw)
 
             def redraw(self_inner) -> None:
-                if getattr(self_inner, "_pose", None) is None or getattr(self_inner, "_rig", None) is None:
-                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-                    glFlush()
-                    return
-
                 w = int(self_inner.winfo_width())
                 h = int(self_inner.winfo_height())
                 if w <= 1 or h <= 1:
                     return
                 glViewport(0, 0, w, h)
 
-                # Basic fixed camera:
-                # orthographic projection with auto-scale-ish; later you'll add real camera controls.
                 glMatrixMode(GL_PROJECTION)
                 glLoadIdentity()
-                glTranslatef(0.0, 0.0, -300.0)
                 aspect = float(w) / float(h)
-                # units are in wc3 coordinates; start with a generous box
                 s = getattr(self_inner, "_ortho_scale", 650.0)
-                #glOrtho(-s * aspect, s * aspect, -s, s, -2000.0, 2000.0)
                 glOrtho(-s * aspect, s * aspect, -s, s, -10000.0, 10000.0)
 
                 glMatrixMode(GL_MODELVIEW)
                 glLoadIdentity()
+                glTranslatef(0.0, 0.0, -300.0)
+
 
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-                pose: Pose = self_inner._pose
-                rig: Rig = self_inner._rig
-                active_ids = getattr(self_inner, "_active_ids", None)
-
-                glLineWidth(3.0)
+                # --- DEBUG CROSSHAIR (always) ---
+                glLineWidth(4.0)
                 glBegin(GL_LINES)
-
-                # red horizontal
                 glColor3f(1.0, 0.0, 0.0)
                 glVertex3f(-100.0, 0.0, 0.0)
                 glVertex3f(100.0, 0.0, 0.0)
 
-                # green vertical
                 glColor3f(0.0, 1.0, 0.0)
                 glVertex3f(0.0, -100.0, 0.0)
                 glVertex3f(0.0, 100.0, 0.0)
-
                 glEnd()
 
+                pose = getattr(self_inner, "_pose", None)
+                rig = getattr(self_inner, "_rig", None)
+                if pose is None or rig is None:
+                    glFlush()
+                    return
+
+                # --- BONES ---
+                active_ids = getattr(self_inner, "_active_ids", None)
+                edge_count=0
+                printed=0
+                               
                 glLineWidth(2.0)
-                glColor3f(1.0, 0.0, 0.0)
-                glBegin(GL_LINES)
-                glVertex3f(-100.0, 0.0, 0.0); glVertex3f(100.0, 0.0, 0.0)
-                glVertex3f(0.0, -100.0, 0.0); glVertex3f(0.0, 100.0, 0.0)
-                glEnd()
-
                 glBegin(GL_LINES)
                 for oid, b in rig.bones.items():
+
                     pid = b.parent_id
                     if pid is None or pid not in rig.bones:
                         continue
@@ -154,16 +145,21 @@ class GLViewerFrame(tk.Frame):
                     p1 = pose.world_pos.get(oid)
                     if p0 is None or p1 is None:
                         continue
-
+                    if printed < 3:
+                        print("EDGE", pid, "->", oid, "p0=", p0, "p1=", p1)
+                        printed += 1 
                     if active_ids is not None and oid in active_ids:
-                        glColor3f(1.0, 0.8, 0.2)  # highlight
+                        glColor3f(1.0, 0.8, 0.2)
                     else:
                         glColor3f(0.7, 0.7, 0.9)
 
                     glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
                     glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
                 glEnd()
+                if edge_count == 0:
+                    print("WARNING: drew 0 bone edges (check parent_id wiring)")
                 glFlush()
+
 
         self._impl = _Impl(self, width=640, height=480)
         self._impl.pack(fill="both", expand=True)

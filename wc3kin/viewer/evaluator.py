@@ -120,6 +120,25 @@ def _parse_quat(q: Any, default: Quat) -> Quat:
         return default
     return (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
 
+def build_rig_from_mdl_nodes(nodes_by_id) -> Rig:
+    bones: dict[int, BoneDef] = {}
+    roots: list[int] = []
+
+    for oid, n in nodes_by_id.items():
+        bones[oid] = BoneDef(
+            name=f"{n.type}:{n.name}",
+            object_id=oid,
+            parent_id=n.parent_id,
+            pivot=n.pivot,
+        )
+
+    for oid, b in bones.items():
+        pid = b.parent_id
+        if pid is None or pid < 0 or pid not in bones:
+            roots.append(oid)
+
+    roots = sorted(set(roots))
+    return Rig(bones=bones, roots=roots)
 
 def build_anims_from_boneanims_json(data: dict[str, Any]) -> dict[int, BoneAnimChannels]:
     out: dict[int, BoneAnimChannels] = {}

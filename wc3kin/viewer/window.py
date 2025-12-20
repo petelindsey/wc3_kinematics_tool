@@ -12,6 +12,10 @@ from .tk_gl_widget import GLViewerFrame
 from .types import SequenceDef
 from .. import db as dbmod
 
+from pathlib import Path
+from wc3kin.viewer.mdl_nodes import load_nodes_from_mdl
+from wc3kin.viewer.evaluator import build_rig_from_mdl_nodes
+
 
 class ViewerWindow(tk.Toplevel):
     """
@@ -115,20 +119,15 @@ class ViewerWindow(tk.Toplevel):
         self.after(self.TICK_MS, self._tick)
 
     def _load_from_db(self) -> None:
-        # Ensure sequence exists
         seq = dbmod.get_sequence_detail(self.con, self.unit_id, self.sequence_name)
         if seq is None:
             raise RuntimeError(f"Sequence not found in DB for unit_id={self.unit_id}: {self.sequence_name}")
         self.seq = seq
         self.t_ms = int(seq.start_ms)
 
-        # Need harvested blobs
         bones_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "bones")
         boneanims_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "boneanims")
-        print("bones_json keys:", bones_json.keys())
-        print("bones_json bones count:", len(bones_json.get("bones") or []))
-        if bones_json.get("bones"):
-            print("first bone:", bones_json["bones"][0])
+
         if bones_json is None or boneanims_json is None:
             raise RuntimeError(
                 "Missing harvested JSON blobs in DB.\n"
@@ -136,11 +135,24 @@ class ViewerWindow(tk.Toplevel):
                 "Use blob ingest (best-effort) before opening viewer."
             )
 
-        rig = build_rig_from_bones_json(bones_json)
+        mdl_path_str = bones_json.get("mdl")
+        if not mdl_path_str:
+            raise RuntimeError("bones_json missing 'mdl' path; cannot load MDL for viewer rig.")
+        mdl_path = Path(mdl_path_str)
+
+        if not mdl_path.exists():
+            raise RuntimeError(f"MDL path does not exist on disk: {mdl_path}")
+
+        # Build full hierarchy from MDL (viewer-only)
+        nodes_by_id = load_nodes_from_mdl(mdl_path)
+        rig = build_rig_from_mdl_nodes(nodes_by_id)
+
+        # Animation channels still come from harvested JSON (authoritative kinematics)
         anims = build_anims_from_boneanims_json(boneanims_json)
+
         self._rig = rig
         self._evaluator = UnitAnimEvaluator(rig=rig, anims=anims)
-
+        
     def _render_current(self) -> None:
         if self._evaluator is None or self._rig is None:
             return
