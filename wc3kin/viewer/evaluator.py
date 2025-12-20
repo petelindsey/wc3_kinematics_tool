@@ -121,24 +121,43 @@ def _parse_quat(q: Any, default: Quat) -> Quat:
     return (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
 
 def build_rig_from_mdl_nodes(nodes_by_id) -> Rig:
+    """
+    Viewer-only: treat *all* MDL nodes as rig nodes so parent chains work
+    even when parents are Helpers/Attachments/etc.
+
+    The evaluator only cares about:
+      - object_id
+      - parent_id
+      - pivot
+    """
     bones: dict[int, BoneDef] = {}
-    roots: list[int] = []
+    children: dict[int, list[int]] = {}
 
+    # Build BoneDef for every node (not just Bone blocks)
     for oid, n in nodes_by_id.items():
+        pid = n.parent_id
         bones[oid] = BoneDef(
-            name=f"{n.type}:{n.name}",
-            object_id=oid,
-            parent_id=n.parent_id,
-            pivot=n.pivot,
+            object_id=int(oid),
+            parent_id=int(pid) if pid is not None else None,
+            name=str(n.name),
+            pivot=(float(n.pivot[0]), float(n.pivot[1]), float(n.pivot[2])),
         )
+        if pid is not None and int(pid) in nodes_by_id:
+            children.setdefault(int(pid), []).append(int(oid))
 
-    for oid, b in bones.items():
-        pid = b.parent_id
-        if pid is None or pid < 0 or pid not in bones:
-            roots.append(oid)
+    # Stable ordering (helps reproducibility + debugging)
+    for k in list(children.keys()):
+        children[k].sort()
 
-    roots = sorted(set(roots))
-    return Rig(bones=bones, roots=roots)
+    # Roots: anything whose parent is missing or None
+    if bones:
+        all_ids = set(bones.keys())
+        child_ids = {cid for kids in children.values() for cid in kids}
+        roots = sorted(list(all_ids - child_ids))
+    else:
+        roots = []
+
+    return Rig(bones=bones, children=children, roots=roots)
 
 def build_anims_from_boneanims_json(data: dict[str, Any]) -> dict[int, BoneAnimChannels]:
     out: dict[int, BoneAnimChannels] = {}
@@ -233,7 +252,8 @@ class UnitAnimEvaluator:
         for oid in bone_ids:
             pivot = self.rig.bones[oid].pivot
             
-            world_pos[oid] = transform_point(world[oid], (0.0, 0.0, 0.0))
+            pivot = self.rig.bones[oid].pivot
+            world_pos[oid] = transform_point(world[oid], pivot)
             
 
         return Pose(world_mats=world, world_pos=world_pos)
