@@ -177,6 +177,25 @@ class ViewerWindow(tk.Toplevel):
                 + (f" min={min(all_times)} max={max(all_times)} count={len(all_times)}" if all_times else ""))
         except Exception as e:
             print(f'Load From DB Error:{e}')
+
+        start = int(self.seq.start_ms)
+        end = int(self.seq.end_ms)
+
+        hits = []
+        for oid, ch in anims.items():
+            times = []
+            times.extend([k.time_ms for k in ch.translation])
+            times.extend([k.time_ms for k in ch.rotation])
+            times.extend([k.time_ms for k in ch.scaling])
+            times = sorted(set(times))
+            in_win = [t for t in times if start <= t <= end]
+            if len(in_win) >= 2:
+                hits.append((oid, in_win[0], in_win[-1], len(in_win)))
+
+        hits.sort(key=lambda x: -x[3])
+        print(f"[viewer] keys_in_window: bones_with_2+keys={len(hits)} (showing up to 8)")
+        print("[viewer] sample:", hits[:8])
+        
         self._rig = rig
         self._evaluator = UnitAnimEvaluator(rig=rig, anims=anims)
         
@@ -186,7 +205,8 @@ class ViewerWindow(tk.Toplevel):
         #pose = self._evaluator.evaluate_pose(self.t_ms)
         offset = int(getattr(self, "_time_offset", 0))
         t_sample = self.t_ms - offset
-        pose = self._evaluator.evaluate_pose(t_sample)
+        #pose = self._evaluator.evaluate_pose(t_sample)
+        pose = self._evaluator.evaluate_pose(self.t_ms)
         if not hasattr(self, "_fit_done"):
             xs = [p[0] for p in pose.world_pos.values()]
             ys = [p[1] for p in pose.world_pos.values()]
