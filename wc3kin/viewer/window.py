@@ -119,6 +119,7 @@ class ViewerWindow(tk.Toplevel):
         self.after(self.TICK_MS, self._tick)
 
     def _load_from_db(self) -> None:
+        print('load from db called')
         seq = dbmod.get_sequence_detail(self.con, self.unit_id, self.sequence_name)
         if seq is None:
             raise RuntimeError(f"Sequence not found in DB for unit_id={self.unit_id}: {self.sequence_name}")
@@ -127,7 +128,7 @@ class ViewerWindow(tk.Toplevel):
 
         bones_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "bones")
         boneanims_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "boneanims")
-
+        print('processing bones json')
         if bones_json is None or boneanims_json is None:
             raise RuntimeError(
                 "Missing harvested JSON blobs in DB.\n"
@@ -135,15 +136,19 @@ class ViewerWindow(tk.Toplevel):
                 "Use blob ingest (best-effort) before opening viewer."
             )
 
+
         mdl_path_str = bones_json.get("mdl")
         if not mdl_path_str:
+            print("bones_json missing 'mdl' path; cannot load MDL for viewer rig.")
             raise RuntimeError("bones_json missing 'mdl' path; cannot load MDL for viewer rig.")
         mdl_path = Path(mdl_path_str)
 
         if not mdl_path.exists():
+            print(f"MDL path does not exist on disk: {mdl_path}")
             raise RuntimeError(f"MDL path does not exist on disk: {mdl_path}")
 
         # Build full hierarchy from MDL (viewer-only)
+        print('Building Nodes and Rig')
         nodes_by_id = load_nodes_from_mdl(mdl_path)
         rig = build_rig_from_mdl_nodes(nodes_by_id)
 
@@ -151,21 +156,27 @@ class ViewerWindow(tk.Toplevel):
         anims = build_anims_from_boneanims_json(boneanims_json)
         # --- DEBUG: do boneanim key times line up with sequence times? ---
         self._time_offset = 0
+        print('Building All Times')
         all_times = []
         for ch in anims.values():
             all_times.extend([k.time_ms for k in ch.translation])
             all_times.extend([k.time_ms for k in ch.rotation])
             all_times.extend([k.time_ms for k in ch.scaling])
+        print('Checking if All Times is empty')
+        try:
+            if all_times:
+                keys_min, keys_max = min(all_times), max(all_times)
+                seq_dur = int(self.seq.end_ms - self.seq.start_ms)
 
-        if all_times:
-            keys_min, keys_max = min(all_times), max(all_times)
-            seq_dur = int(self.seq.end_ms - self.seq.start_ms)
-
-            # Heuristic: if keys look like [0..dur] but seq is not starting at 0, treat keys as relative
-            if keys_min >= 0 and keys_max <= seq_dur + 2 and int(self.seq.start_ms) != 0:
-                self._time_offset = int(self.seq.start_ms)
-                print(f"[viewer] using relative key times; offset={self._time_offset}ms")
-
+                # Heuristic: if keys look like [0..dur] but seq is not starting at 0, treat keys as relative
+                if keys_min >= 0 and keys_max <= seq_dur + 2 and int(self.seq.start_ms) != 0:
+                    self._time_offset = int(self.seq.start_ms)
+                    print(f"[viewer] using relative key times; offset={self._time_offset}ms")
+            print(f"[viewer] seq={self.seq.name} start={self.seq.start_ms} end={self.seq.end_ms} dur={int(self.seq.end_ms-self.seq.start_ms)}")
+            print(f"[viewer] key_times: empty={not bool(all_times)}"
+                + (f" min={min(all_times)} max={max(all_times)} count={len(all_times)}" if all_times else ""))
+        except Exception as e:
+            print(f'Load From DB Error:{e}')
         self._rig = rig
         self._evaluator = UnitAnimEvaluator(rig=rig, anims=anims)
         
@@ -173,7 +184,8 @@ class ViewerWindow(tk.Toplevel):
         if self._evaluator is None or self._rig is None:
             return
         #pose = self._evaluator.evaluate_pose(self.t_ms)
-        t_sample = self.t_ms - int(self.seq.start_ms) if self.seq is not None else self.t_ms
+        offset = int(getattr(self, "_time_offset", 0))
+        t_sample = self.t_ms - offset
         pose = self._evaluator.evaluate_pose(t_sample)
         if not hasattr(self, "_fit_done"):
             xs = [p[0] for p in pose.world_pos.values()]
