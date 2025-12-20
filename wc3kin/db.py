@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,17 @@ def connect(db_path: Path) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON;")
     return con
+
+
+def _get_schema_version(con: sqlite3.Connection) -> int:
+    try:
+        cur = con.execute("SELECT value FROM meta WHERE key='schema_version';")
+        row = cur.fetchone()
+        if not row:
+            return 0
+        return int(row["value"])
+    except Exception:
+        return 0
 
 
 def init_db(con: sqlite3.Connection) -> None:
@@ -95,8 +108,34 @@ def init_db(con: sqlite3.Connection) -> None:
         """
     )
 
-    # version tracking
-    con.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?);", (str(SCHEMA_VERSION),))
+    # schema v2: canonical WC3 sequences from harvested JSON
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sequences (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          unit_id INTEGER NOT NULL,
+          name TEXT NOT NULL,
+          start INTEGER NOT NULL,
+          end INTEGER NOT NULL,
+          category TEXT NOT NULL DEFAULT 'unknown',
+          is_death INTEGER NOT NULL DEFAULT 0,
+          is_corpse INTEGER NOT NULL DEFAULT 0,
+          source TEXT NOT NULL DEFAULT 'harvest_json',
+          created_at TEXT NOT NULL,
+          UNIQUE(unit_id, name),
+          FOREIGN KEY(unit_id) REFERENCES units(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+    # version tracking + migration bump
+    con.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1');")
+    current = _get_schema_version(con)
+    if current < SCHEMA_VERSION:
+        con.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version';",
+            (str(SCHEMA_VERSION),),
+        )
     con.commit()
 
 
@@ -144,6 +183,7 @@ def get_units_for_race(con: sqlite3.Connection, race: str) -> list[tuple[int, st
 
 
 def get_animations_for_unit(con: sqlite3.Connection, unit_id: int) -> list[str]:
+    # Legacy list (Blender-derived)
     cur = con.execute(
         """
         SELECT name
@@ -153,6 +193,36 @@ def get_animations_for_unit(con: sqlite3.Connection, unit_id: int) -> list[str]:
         """,
         (unit_id,),
     )
+    return [str(r["name"]) for r in cur.fetchall()]
+
+
+def get_sequences_for_unit(
+    con: sqlite3.Connection,
+    unit_id: int,
+    include_death_and_corpse: bool = False,
+) -> list[str]:
+    if include_death_and_corpse:
+        cur = con.execute(
+            """
+            SELECT name
+            FROM sequences
+            WHERE unit_id = ?
+            ORDER BY name;
+            """,
+            (unit_id,),
+        )
+    else:
+        cur = con.execute(
+            """
+            SELECT name
+            FROM sequences
+            WHERE unit_id = ?
+              AND is_death = 0
+              AND is_corpse = 0
+            ORDER BY name;
+            """,
+            (unit_id,),
+        )
     return [str(r["name"]) for r in cur.fetchall()]
 
 
@@ -175,3 +245,61 @@ def get_unit_detail(con: sqlite3.Connection, unit_id: int) -> Optional[UnitRow]:
         primary_model_path=str(row["primary_model_path"]),
         last_scanned=str(row["last_scanned"]),
     )
+
+
+def ingest_sequences_from_harvest_json(
+    con: sqlite3.Connection,
+    unit_id: int,
+    model_abspath: Path,
+) -> int:
+    """
+    Read harvested JSONs next to the model and upsert canonical WC3 sequences.
+
+    We primarily use <stem>_materialsets.json because it contains:
+      - sequences: name -> {start,end}
+      - sequence_category: name -> category (death/corpse/...)
+    """
+    stem = model_abspath.stem
+    mat_path = model_abspath.with_name(f"{stem}_materialsets.json")
+    if not mat_path.is_file():
+        # nothing to ingest
+        return 0
+
+    data = json.loads(mat_path.read_text(encoding="utf-8"))
+    seq_ranges = data.get("sequences") or {}
+    seq_cat = data.get("sequence_category") or {}
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    rows: list[tuple] = []
+    for name, rng in seq_ranges.items():
+        try:
+            start = int(rng.get("start"))
+            end = int(rng.get("end"))
+        except Exception:
+            continue
+        cat = str(seq_cat.get(name) or "unknown")
+        is_death = 1 if cat.lower() == "death" else 0
+        is_corpse = 1 if cat.lower() == "corpse" else 0
+        rows.append((unit_id, str(name), start, end, cat, is_death, is_corpse, now))
+
+    if not rows:
+        return 0
+
+    cur = con.cursor()
+    cur.executemany(
+        """
+        INSERT INTO sequences (unit_id, name, start, end, category, is_death, is_corpse, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(unit_id, name) DO UPDATE SET
+          start=excluded.start,
+          end=excluded.end,
+          category=excluded.category,
+          is_death=excluded.is_death,
+          is_corpse=excluded.is_corpse
+        ;
+        """,
+        rows,
+    )
+    con.commit()
+    return cur.rowcount

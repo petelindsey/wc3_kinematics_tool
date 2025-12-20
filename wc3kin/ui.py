@@ -5,9 +5,7 @@ import traceback
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from pathlib import Path
-import subprocess
-import json
+import sqlite3
 
 from .config import load_config
 from .db import (
@@ -15,9 +13,10 @@ from .db import (
     init_db,
     get_races,
     get_units_for_race,
-    get_animations_for_unit,
+    get_sequences_for_unit,
     get_unit_detail,
     upsert_units,
+    ingest_sequences_from_harvest_json,
 )
 from .extract import run_blender_extract, ingest_extract_to_db
 from .scanner import scan_units, to_db_rows
@@ -37,10 +36,13 @@ def _setup_logger(log_path: Path) -> logging.Logger:
 
 
 class App(tk.Tk):
+    BASE_GEOM = "980x620"
+    SQL_GEOM = "980x820"
+
     def __init__(self, config_path: Path) -> None:
         super().__init__()
         self.title("WC3 Units Kinematics Library")
-        self.geometry("980x620")
+        self.geometry(self.BASE_GEOM)
 
         self.cfg = load_config(config_path)
         self.logger = _setup_logger(self.cfg.log_path)
@@ -48,23 +50,11 @@ class App(tk.Tk):
         self.con = connect(self.cfg.db_path)
         init_db(self.con)
 
-        #run any local db commands as needed
-        query_path = Path("d:/wc3_kinematics_tool/query.txt")
-        if query_path.is_file():
-            try:
-                sql = query_path.read_text(encoding="utf-8").strip()
-                print(f'Executing SQL:{sql}')
-                if sql:
-                    self.con.executescript(sql)
-                    self.con.commit()
-                    self.logger.info("Executed startup query from query.txt")
-            except Exception as e:
-                self.logger.exception("Failed to execute query.txt on startup")
-
         # UI state
         self.race_var = tk.StringVar(value="")
         self.unit_var = tk.StringVar(value="")
         self.anim_var = tk.StringVar(value="")
+        self.show_death_var = tk.BooleanVar(value=False)
 
         self.unit_id_by_name: dict[str, int] = {}
 
@@ -89,27 +79,41 @@ class App(tk.Tk):
         self.unit_cb.pack(side="left", padx=(6, 16))
         self.unit_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_unit_changed())
 
-        ttk.Label(row, text="Animation").pack(side="left")
+        ttk.Label(row, text="Sequence").pack(side="left")
         self.anim_cb = ttk.Combobox(row, textvariable=self.anim_var, state="readonly", width=28)
-        self.anim_cb.pack(side="left", padx=(6, 0))
+        self.anim_cb.pack(side="left", padx=(6, 8))
+
+        self.show_death_cb = ttk.Checkbutton(
+            row,
+            text="Show death/corpse",
+            variable=self.show_death_var,
+            command=self._on_unit_changed,
+        )
+        self.show_death_cb.pack(side="left")
 
         # buttons
         btns = ttk.Frame(top)
         btns.pack(fill="x", pady=(10, 0))
 
         ttk.Button(btns, text="Import / Rescan Units", command=self._import_rescan).pack(side="left")
-        ttk.Button(btns, text="Ingest Animations (Selected)", command=self._ingest_selected).pack(side="left", padx=(10, 0))
+        ttk.Button(btns, text="Ingest (Selected)", command=self._ingest_selected).pack(side="left", padx=(10, 0))
         ttk.Button(
             btns,
             text="Ingest All (This Race)",
             command=lambda: self._ingest_all(only_selected_race=True),
         ).pack(side="left", padx=4)
-        
+
         ttk.Button(
             btns,
-            text="Ingest Animations (All Units)",
+            text="Ingest (All Units)",
             command=lambda: self._ingest_all(only_selected_race=False),
         ).pack(side="left", padx=(10, 0))
+
+        ttk.Button(
+            btns,
+            text="SQL Console",
+            command=self._toggle_sql_console,
+        ).pack(side="right")
 
         # status
         self.status_var = tk.StringVar(value="Ready.")
@@ -121,6 +125,21 @@ class App(tk.Tk):
 
         self.info_text = tk.Text(info_frame, wrap="word")
         self.info_text.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # SQL console (hidden by default)
+        self.sql_frame = ttk.LabelFrame(self, text="SQL Console (use carefully)")
+        self.sql_visible = False
+
+        self.sql_query = tk.Text(self.sql_frame, height=5, wrap="word")
+        self.sql_query.pack(fill="x", expand=False, padx=8, pady=(8, 4))
+
+        sql_btn_row = ttk.Frame(self.sql_frame)
+        sql_btn_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(sql_btn_row, text="Run", command=self._run_sql).pack(side="left")
+        ttk.Button(sql_btn_row, text="Close", command=self._toggle_sql_console).pack(side="left", padx=(8, 0))
+
+        self.sql_output = tk.Text(self.sql_frame, height=8, wrap="word")
+        self.sql_output.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
     def _set_status(self, s: str) -> None:
         self.status_var.set(s)
@@ -150,9 +169,7 @@ class App(tk.Tk):
             self.unit_cb["values"] = []
             return
 
-        # list[(unit_id, unit_name)]
         units = get_units_for_race(self.con, race)
-
         self.unit_id_by_name = {name: uid for uid, name in units}
         unit_names = [name for _, name in units]
         self.unit_cb["values"] = unit_names
@@ -174,19 +191,16 @@ class App(tk.Tk):
             self._write_info("No unit selected.")
             return
 
-        # --- fetch unit detail ---
         detail = get_unit_detail(self.con, uid)
         if not detail:
             self._write_info("Failed to load unit detail from DB.")
             return
 
-        # --- fetch animations ---
-        anims = get_animations_for_unit(self.con, uid)
-        self.anim_cb["values"] = anims
-        if anims:
-            self.anim_var.set(anims[0])
+        seqs = get_sequences_for_unit(self.con, uid, include_death_and_corpse=bool(self.show_death_var.get()))
+        self.anim_cb["values"] = seqs
+        if seqs:
+            self.anim_var.set(seqs[0])
 
-        # --- print info ---
         self._write_info(
             f"Selected Unit:\n"
             f"  Race: {detail.race}\n"
@@ -194,9 +208,8 @@ class App(tk.Tk):
             f"  Unit Dir: {detail.unit_dir}\n"
             f"  Primary Model: {detail.primary_model_path}\n"
             f"  Last Scanned: {detail.last_scanned}\n\n"
-            f"Animations in DB: {len(anims)}\n"
+            f"Sequences in DB: {len(seqs)}\n"
         )
-
 
     def _import_rescan(self) -> None:
         try:
@@ -257,17 +270,22 @@ class App(tk.Tk):
                     f"--- Blender stdout ---\n{extracted.blender_stdout}\n\n"
                     f"--- Blender stderr ---\n{extracted.blender_stderr}\n"
                 )
-                print(msg)
                 self._write_info(msg, append=True)
                 self._set_status("Ingest failed.")
                 return False
 
+            # Step 2 placeholder (bones + Blender-derived animations)
             ingest_extract_to_db(self.con, uid, extracted)
+
+            # Canonical WC3 sequences from harvested JSONs (preferred)
+            seq_upserts = ingest_sequences_from_harvest_json(self.con, uid, model_abspath)
+
             self._write_info(
                 f"Ingest OK: {detail.unit_name}\n"
                 f"  Used: {extracted.input_used}\n"
                 f"  Bones: {len(extracted.bones)}\n"
-                f"  Animations: {len(extracted.animations)}\n",
+                f"  Blender Animations (legacy): {len(extracted.animations)}\n"
+                f"  Sequences upserted (harvest JSON): {seq_upserts}\n",
                 append=True,
             )
             self._set_status(f"Ingest OK: {detail.unit_name}")
@@ -280,13 +298,11 @@ class App(tk.Tk):
                 f"Model: {model_abspath}\n"
                 f"{repr(e)}\n\n{traceback.format_exc()}"
             )
-            print(msg)
             self._write_info(msg, append=True)
             self._set_status("Ingest exception.")
             return False
 
         finally:
-            # refresh animation dropdown for currently selected unit
             self._on_unit_changed()
 
     def _ingest_all(self, only_selected_race: bool = False) -> None:
@@ -320,6 +336,51 @@ class App(tk.Tk):
 
         self._set_status(f"Batch ingest done. OK={ok}, Failed={failed}")
         self._write_info(f"Batch ingest done. OK={ok}, Failed={failed}", append=True)
+
+    # ---------------- SQL console ----------------
+
+    def _toggle_sql_console(self) -> None:
+        if self.sql_visible:
+            # hide
+            self.sql_frame.pack_forget()
+            self.sql_visible = False
+            self.geometry(self.BASE_GEOM)
+        else:
+            # show (clear both boxes every time)
+            self.sql_query.delete("1.0", "end")
+            self.sql_output.delete("1.0", "end")
+            self.sql_frame.pack(fill="both", expand=False, padx=10, pady=(0, 10))
+            self.sql_visible = True
+            self.geometry(self.SQL_GEOM)
+
+    def _run_sql(self) -> None:
+        sql = self.sql_query.get("1.0", "end").strip()
+        self.sql_output.delete("1.0", "end")
+        if not sql:
+            self.sql_output.insert("end", "No SQL provided.\n")
+            return
+
+        try:
+            first = sql.lstrip().split(None, 1)[0].lower() if sql.lstrip() else ""
+            if first in {"select", "pragma", "with"}:
+                cur = self.con.execute(sql)
+                rows = cur.fetchall()
+                headers = [d[0] for d in cur.description] if cur.description else []
+                if headers:
+                    self.sql_output.insert("end", "\t".join(headers) + "\n")
+                    self.sql_output.insert("end", "-" * 80 + "\n")
+                for r in rows:
+                    self.sql_output.insert("end", "\t".join(str(r[h]) for h in headers) + "\n")
+                self.sql_output.insert("end", f"\nRows: {len(rows)}\n")
+            else:
+                self.con.executescript(sql)
+                self.con.commit()
+                self.sql_output.insert("end", "OK (statement executed and committed)\n")
+        except sqlite3.Error as e:
+            self.sql_output.insert("end", f"SQLite error: {e!r}\n")
+        except Exception as e:
+            self.sql_output.insert("end", f"Error: {e!r}\n")
+
 
 def run_app() -> None:
     here = Path(__file__).resolve().parent.parent
