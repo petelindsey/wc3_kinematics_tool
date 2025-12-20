@@ -192,7 +192,7 @@ class UnitAnimEvaluator:
             m = mat4_mul(mat4_translate(pivot), mat4_translate(trans))
             m = mat4_mul(m, mat4_from_quat(rot))
             m = mat4_mul(m, mat4_scale(scale))
-            m = mat4_mul(m, mat4_translate((-pivot[0], -pivot[1], -pivot[2])))
+            local[oid] = m
             local[oid] = m
 
         # World resolve: forest roots

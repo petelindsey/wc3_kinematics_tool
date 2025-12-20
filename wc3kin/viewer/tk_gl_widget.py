@@ -165,12 +165,13 @@ class GLViewerFrame(tk.Frame):
         self._impl._pose = pose
         self._impl._rig = rig
         self._impl._active_ids = active_ids
+        xs = [p[0] for p in pose.world_pos.values()]
+        ys = [p[1] for p in pose.world_pos.values()]
+        zs = [p[2] for p in pose.world_pos.values()]
         print(
-            "POSE:",
-            len(pose.world_pos),
-            "bones;",
-            "min/max:",
-            min(pose.world_pos.values()),
-            max(pose.world_pos.values()),
+            f"POSE: {len(xs)} bones; "
+            f"x[{min(xs):.2f},{max(xs):.2f}] "
+            f"y[{min(ys):.2f},{max(ys):.2f}] "
+            f"z[{min(zs):.2f},{max(zs):.2f}]"
         )
         self._impl.request_redraw()
