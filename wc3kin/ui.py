@@ -63,12 +63,19 @@ class App(tk.Tk):
         self.anim_var = tk.StringVar(value="")
         self.show_death_var = tk.BooleanVar(value=False)
         self.json_only_var = tk.BooleanVar(value=True)
+        self.force_update_var = tk.BooleanVar(value=False) 
 
         # menu
         menubar = tk.Menu(self)
         self.config(menu=menubar)
 
         ingest_menu = tk.Menu(menubar, tearoff=0)
+        ingest_menu.add_checkbutton(
+            label="Force Update",
+            variable=self.force_update_var,
+            onvalue=True,
+            offvalue=False,
+        )
         ingest_menu.add_checkbutton(
             label="JSON Only",
             variable=self.json_only_var,
@@ -138,7 +145,12 @@ class App(tk.Tk):
             command=self._on_unit_changed,
         )
         self.show_death_cb.pack(side="left")
-
+        self.force_update_cb = ttk.Checkbutton(
+            row,
+            text="Force update",
+            variable=self.force_update_var,
+        )
+        self.force_update_cb.pack(side="left", padx=(10, 0))
         # buttons
         btns = ttk.Frame(top)
         btns.pack(fill="x", pady=(10, 0))
@@ -477,6 +489,9 @@ class App(tk.Tk):
         When "JSON Only" is enabled, this uses the harvested JSON fast-path and does not require Blender.
         When disabled, it falls back to the full ingest pipeline (which may invoke Blender).
         """
+        if self.force_update_var.get():
+            self._ingest_selected()
+            return
         if self.json_only_var.get():
             self._ingest_sequences_json_selected()
         else:
@@ -485,6 +500,9 @@ class App(tk.Tk):
 
     def _menu_ingest_sequences_all(self, *, only_selected_race: bool) -> None:
         """Batch-ingest sequences for a race or all units, respecting the JSON-only toggle."""
+        if self.force_update_var.get():
+            self._ingest_all()
+            return
         if self.json_only_var.get():
             self._ingest_sequences_json_all(only_selected_race=only_selected_race)
         else:
@@ -554,6 +572,7 @@ class App(tk.Tk):
             self._on_unit_changed()
 
     def _ingest_unit_id(self, uid: int) -> bool:
+        force_update = bool(self.force_update_var.get())
         detail = get_unit_detail(self.con, uid)
         if not detail:
             self._write_info(f"Ingest failed: missing unit detail for id={uid}", append=True)
@@ -576,6 +595,7 @@ class App(tk.Tk):
                 wc3_json_root=self.cfg.wc3_json_root,
                 texture_root=self.cfg.texture_root,
                 logger=self.logger,
+                force_update=force_update
             )
 
             if extracted.error:

@@ -560,12 +560,13 @@ def ingest_known_harvested_json_blobs(
 
     stem = model_abspath.stem
     candidates = {
-        "materialsets": model_abspath.with_name(f"{stem}_materialsets.json"),
-        "bones": model_abspath.with_name(f"{stem}_bones.json"),
-        "boneanims": model_abspath.with_name(f"{stem}_boneanims.json"),
-        "animslices": model_abspath.with_name(f"{stem}_animslices.json"),
-        "geosets": model_abspath.with_name(f"{stem}_geosets.json"),
-        "meshsets": model_abspath.with_name(f"{stem}_meshsets.json"),
+    "materialsets": model_abspath.with_name(f"{stem}_materialsets.json"),
+    "bones": model_abspath.with_name(f"{stem}_bones.json"),
+    "boneanims": model_abspath.with_name(f"{stem}_boneanims.json"),
+    "nodeanims": model_abspath.with_name(f"{stem}_nodeanims.json"),  # <--- add this
+    "animslices": model_abspath.with_name(f"{stem}_animslices.json"),
+    "geosets": model_abspath.with_name(f"{stem}_geosets.json"),
+    "meshsets": model_abspath.with_name(f"{stem}_meshsets.json"),
     }
 
     out: dict[str, int] = {}

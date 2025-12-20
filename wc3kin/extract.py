@@ -52,14 +52,25 @@ def ensure_fbx_for_wc3_model(
     wc3_json_root: Optional[Path],
     texture_root: Optional[Path],
     logger=None,
+    force_update: bool = False,  # NEW
 ) -> Path:
     ext = model_abspath.suffix.lower()
     if ext not in (".mdl", ".mdx"):
         return model_abspath
 
     out_fbx = _cache_fbx_path(project_root, model_abspath)
-    if out_fbx.exists() and out_fbx.stat().st_size > 0:
+
+    # NEW: bypass cached FBX when force_update is enabled
+    if (not force_update) and out_fbx.exists() and out_fbx.stat().st_size > 0:
         return out_fbx
+
+    # Optional but recommended: if forcing, delete stale cached FBX first
+    if force_update and out_fbx.exists():
+        try:
+            out_fbx.unlink()
+        except Exception:
+            if logger:
+                logger.warning("Failed to delete cached FBX (continuing): %s", out_fbx)
 
     converter_script = _project_script(project_root, "blender_scripts/wc3_export_with_meshes.py")
 
@@ -88,7 +99,6 @@ def ensure_fbx_for_wc3_model(
         raise RuntimeError(f"WC3 conversion failed:\n{p.stderr}")
 
     return out_fbx
-
 
 def pick_extractor_script(project_root: Path) -> Path:
     return _project_script(project_root, "blender_scripts/kin_extract.py")
@@ -129,6 +139,7 @@ def run_blender_extract(
     wc3_json_root: Optional[Path] = None,
     texture_root: Optional[Path] = None,
     logger=None,
+    force_update=False
 ) -> ExtractResult:
 
     model_for_extract = ensure_fbx_for_wc3_model(
@@ -138,6 +149,7 @@ def run_blender_extract(
         wc3_json_root,
         texture_root,
         logger,
+        force_update=force_update
     )
 
     blender_script = pick_extractor_script(project_root)

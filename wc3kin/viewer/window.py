@@ -195,7 +195,20 @@ class ViewerWindow(tk.Toplevel):
         hits.sort(key=lambda x: -x[3])
         print(f"[viewer] keys_in_window: bones_with_2+keys={len(hits)} (showing up to 8)")
         print("[viewer] sample:", hits[:8])
-        
+
+        oid = 22
+        ch = anims.get(oid)
+        if ch:
+            print(f"[viewer] oid={oid} keys: T={len(ch.translation)} R={len(ch.rotation)} S={len(ch.scaling)}")
+            if ch.translation:
+                print("[viewer]  T first/last:", ch.translation[0], ch.translation[-1])
+            if ch.rotation:
+                print("[viewer]  R first/last:", ch.rotation[0], ch.rotation[-1])
+            if ch.scaling:
+                print("[viewer]  S first/last:", ch.scaling[0], ch.scaling[-1])
+        else:
+            print(f"[viewer] oid={oid} has no channel entry")
+
         self._rig = rig
         self._evaluator = UnitAnimEvaluator(rig=rig, anims=anims)
         
