@@ -8,6 +8,8 @@ from tkinter import ttk
 import sqlite3
 import json
 
+
+from .viewer.window import ViewerWindow
 from .config import load_config
 from .db import (
     connect,
@@ -18,8 +20,10 @@ from .db import (
     get_unit_detail,
     upsert_units,
     ingest_sequences_from_harvest_json,
+    ingest_known_harvested_json_blobs,
     HarvestJsonError,
 )
+
 from .extract import run_blender_extract, ingest_extract_to_db
 from .scanner import scan_units, to_db_rows
 from .kinematics import compute_motion_stats_for_unit
@@ -97,6 +101,7 @@ class App(tk.Tk):
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="SQL Console", command=self._toggle_sql_console)
         menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Viewer", command=self._open_viewer)
 
 
         self.unit_id_by_name: dict[str, int] = {}
@@ -189,6 +194,43 @@ class App(tk.Tk):
         self.sql_output.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self.sql_last_headers: list[str] = []
         self.sql_last_rows: list[dict[str, object]] = []
+
+    def _open_viewer(self) -> None:
+        unit_name = self.unit_var.get().strip()
+        uid = self.unit_id_by_name.get(unit_name)
+        if not uid:
+            self._write_info("Viewer: no unit selected.", append=True)
+            return
+
+        seq_name = self.anim_var.get().strip()
+        if not seq_name:
+            self._write_info("Viewer: no sequence selected.", append=True)
+            return
+
+        detail = get_unit_detail(self.con, uid)
+        if not detail:
+            self._write_info("Viewer: failed to load unit detail from DB.", append=True)
+            return
+
+        model_abspath = (self.cfg.units_root / detail.primary_model_path).resolve()
+
+        # Best-effort: ensure harvested blobs exist in DB (bones/boneanims at minimum)
+        try:
+            ingest_known_harvested_json_blobs(self.con, uid, model_abspath)
+        except Exception as e:
+            self._write_info(f"Viewer: blob ingest warning (continuing): {e!r}", append=True)
+
+        try:
+            ViewerWindow(
+                self,
+                con=self.con,
+                units_root=self.cfg.units_root,
+                unit_id=uid,
+                sequence_name=seq_name,
+            )
+        except Exception as e:
+            self.logger.exception("Viewer open failed")
+            self._write_info(f"Viewer failed:\n{e!r}\n{traceback.format_exc()}", append=True)
 
     def _copy_sql_output_json(self) -> None:
         import json

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
-
+from wc3kin.viewer.types import SequenceDef
 
 SCHEMA_VERSION = 3
 
@@ -26,6 +26,54 @@ class UnitRow:
 
 
 # --- NEW DB HELPERS (add near other helpers) ---
+def get_harvested_json_blob(con: sqlite3.Connection, unit_id: int, kind: str) -> Optional[dict]:
+    """
+    Fetch a raw harvested JSON blob from the `harvested_json` table and parse it.
+    Returns None if missing.
+    """
+    cur = con.execute(
+        """
+        SELECT json_text
+        FROM harvested_json
+        WHERE unit_id = ? AND kind = ?;
+        """,
+        (int(unit_id), str(kind)),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(str(row["json_text"]))
+    except Exception as e:
+        raise HarvestJsonError(f"Failed to parse harvested_json blob for unit_id={unit_id}, kind={kind}: {e!r}") from e
+
+
+def get_sequence_detail(con: sqlite3.Connection, unit_id: int, name: str) -> Optional["SequenceDef"]:
+    """
+    Fetch a sequence row from DB and return a viewer-friendly SequenceDef.
+    """
+    from .viewer.types import SequenceDef  # local import to avoid circular import
+
+    cur = con.execute(
+        """
+        SELECT name, start, end, category, is_death, is_corpse
+        FROM sequences
+        WHERE unit_id = ? AND name = ?;
+        """,
+        (int(unit_id), str(name)),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return SequenceDef(
+        name=str(row["name"]),
+        start_ms=int(row["start"]),
+        end_ms=int(row["end"]),
+        category=str(row["category"]),
+        is_death=bool(int(row["is_death"])),
+        is_corpse=bool(int(row["is_corpse"])),
+    )
+
 def get_bone_stats_for_sequence(con: sqlite3.Connection, unit_id: int, sequence_id: int) -> list[sqlite3.Row]:
     cur = con.execute(
         """
