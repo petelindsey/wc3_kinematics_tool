@@ -149,6 +149,22 @@ class ViewerWindow(tk.Toplevel):
 
         # Animation channels still come from harvested JSON (authoritative kinematics)
         anims = build_anims_from_boneanims_json(boneanims_json)
+        # --- DEBUG: do boneanim key times line up with sequence times? ---
+        self._time_offset = 0
+        all_times = []
+        for ch in anims.values():
+            all_times.extend([k.time_ms for k in ch.translation])
+            all_times.extend([k.time_ms for k in ch.rotation])
+            all_times.extend([k.time_ms for k in ch.scaling])
+
+        if all_times:
+            keys_min, keys_max = min(all_times), max(all_times)
+            seq_dur = int(self.seq.end_ms - self.seq.start_ms)
+
+            # Heuristic: if keys look like [0..dur] but seq is not starting at 0, treat keys as relative
+            if keys_min >= 0 and keys_max <= seq_dur + 2 and int(self.seq.start_ms) != 0:
+                self._time_offset = int(self.seq.start_ms)
+                print(f"[viewer] using relative key times; offset={self._time_offset}ms")
 
         self._rig = rig
         self._evaluator = UnitAnimEvaluator(rig=rig, anims=anims)
@@ -156,7 +172,9 @@ class ViewerWindow(tk.Toplevel):
     def _render_current(self) -> None:
         if self._evaluator is None or self._rig is None:
             return
-        pose = self._evaluator.evaluate_pose(self.t_ms)
+        #pose = self._evaluator.evaluate_pose(self.t_ms)
+        t_sample = self.t_ms - getattr(self, "_time_offset", 0)
+        pose = self._evaluator.evaluate_pose(t_sample)
         if not hasattr(self, "_fit_done"):
             xs = [p[0] for p in pose.world_pos.values()]
             ys = [p[1] for p in pose.world_pos.values()]
