@@ -1,0 +1,25 @@
+diff --git a/wc3kin/extract.py b/wc3kin/extract.py
+index 0000000..0000000 100644
+--- a/wc3kin/extract.py
++++ b/wc3kin/extract.py
+@@ -51,6 +51,7 @@ def ensure_fbx_for_wc3_model(
+     model_abspath: Path,
+     wc3_json_root: Optional[Path],
+     texture_root: Optional[Path],
+     logger=None,
++    force_update: bool = False,
+ ) -> Path:
+@@ -58,9 +59,14 @@ def ensure_fbx_for_wc3_model(
+     if ext not in (".mdl", ".mdx"):
+         return model_abspath
+ 
+     out_fbx = _cache_fbx_path(project_root, model_abspath)
+-    if out_fbx.exists() and out_fbx.stat().st_size > 0:
++    if (not force_update) and out_fbx.exists() and out_fbx.stat().st_size > 0:
+         return out_fbx
++
++    if force_update and out_fbx.exists():
++        try:
++            out_fbx.unlink()
++        except Exception:
++            pass
