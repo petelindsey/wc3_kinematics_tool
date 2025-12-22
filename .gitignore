@@ -8,6 +8,9 @@ config.json
 *.sqlite
 *.db
 
+#diff files
+*.diff
+
 # logs
 *.log
 
