@@ -16,7 +16,7 @@ from wc3kin.viewer.mdl_nodes import load_nodes_from_mdl
 from wc3kin.viewer.evaluator import build_rig_from_mdl_nodes
 
 from .view_persistence import ViewerPersist, default_persistence_path
-
+from .mesh_provider import MdlFileMeshProvider
 
 class ViewerWindow(tk.Toplevel):
     """
@@ -49,8 +49,6 @@ class ViewerWindow(tk.Toplevel):
         self.playing = False
         # loop off by default
         self.loop_var = tk.BooleanVar(value=False)
-        # bones on by default
-        self.bones_var = tk.BooleanVar(value=True)
 
         self.seq: Optional[SequenceDef] = None
         self.t_ms: int = 0
@@ -82,13 +80,6 @@ class ViewerWindow(tk.Toplevel):
 
         ttk.Checkbutton(controls, text="Loop", variable=self.loop_var).pack(side="left", padx=(12, 0))
 
-        ttk.Checkbutton(
-            controls,
-            text="Bones",
-            variable=self.bones_var,
-            command=self._on_toggle_bones,
-        ).pack(side="left", padx=(12, 0))
-
         self.time_lbl = ttk.Label(controls, text="t=0ms")
         self.time_lbl.pack(side="right")
 
@@ -101,13 +92,6 @@ class ViewerWindow(tk.Toplevel):
         self._render_current()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _on_toggle_bones(self) -> None:
-        try:
-            if self.gl is not None:
-                self.gl.set_show_bones(bool(self.bones_var.get()))
-        except Exception:
-            pass
 
     def _reset_camera(self) -> None:
         try:
@@ -164,6 +148,8 @@ class ViewerWindow(tk.Toplevel):
 
     def _load_from_db(self) -> None:
         print("load from db called")
+        self._mesh = None
+        self._mesh_provider = None
         seq = dbmod.get_sequence_detail(self.con, self.unit_id, self.sequence_name)
         if seq is None:
             raise RuntimeError(f"Sequence not found in DB for unit_id={self.unit_id}: {self.sequence_name}")
@@ -189,6 +175,55 @@ class ViewerWindow(tk.Toplevel):
         if not mdl_path.exists():
             print(f"MDL path does not exist on disk: {mdl_path}")
             raise RuntimeError(f"MDL path does not exist on disk: {mdl_path}")
+        
+        try:
+            from .mesh_provider import MdlFileMeshProvider
+
+            print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
+            print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size}")
+
+            self._mesh_provider = MdlFileMeshProvider(mdl_path=mdl_path)
+            self._mesh = self._mesh_provider.load_mesh(con=self.con, unit_id=self.unit_id)
+
+            if self._mesh is None:
+                print("[viewer] Mesh provider returned None (bones-only)")
+            else:
+                self.gl.set_mesh(self._mesh)
+
+                m = self._mesh
+                print(
+                    "[viewer] Mesh loaded:"
+                    f" verts={len(m.vertices)} tris={len(m.triangles)}"
+                    f" vgroups={'yes' if m.vertex_groups else 'no'}"
+                    f" groups_matrices={'yes' if m.groups_matrices else 'no'}"
+                )
+        except Exception as e:
+            self._mesh = None
+            print(f"[viewer] Mesh load failed (bones-only): {e!r}")
+
+        print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
+        print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size if mdl_path.exists() else 'n/a'}")
+        m = self._mesh
+        if m is not None:
+            print(
+                "[viewer] Mesh loaded:"
+                f" verts={len(m.vertices)} tris={len(m.triangles)}"
+                f" vgroups={'yes' if m.vertex_groups else 'no'}"
+                f" groups_matrices={'yes' if m.groups_matrices else 'no'}"
+            )
+            if m.vertex_groups:
+                print(f"[viewer] vertex_groups count={len(m.vertex_groups)} min={min(m.vertex_groups)} max={max(m.vertex_groups)}")
+            if m.groups_matrices:
+                nonempty = sum(1 for g in m.groups_matrices if g)
+                maxlen = max((len(g) for g in m.groups_matrices), default=0)
+                print(f"[viewer] groups_matrices count={len(m.groups_matrices)} nonempty={nonempty} max_group_len={maxlen}")
+
+        self._mesh_provider = MdlFileMeshProvider(mdl_path=mdl_path)
+        self._mesh = self._mesh_provider.load_mesh(con=self.con, unit_id=self.unit_id)
+
+        # pass mesh into GL widget so redraw can render it
+        self.gl.set_mesh(self._mesh)
+
 
         print("Building Nodes and Rig")
         nodes_by_id = load_nodes_from_mdl(mdl_path)
