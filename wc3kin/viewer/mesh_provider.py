@@ -5,8 +5,12 @@ from dataclasses import dataclass
 from typing import Protocol, Optional
 import sqlite3
 from pathlib import Path
+import re
 
 Vec3 = tuple[float, float, float]
+
+
+
 
 @dataclass(frozen=True)
 class MeshData:
@@ -20,6 +24,8 @@ class MeshData:
     vertex_groups: Optional[list[int]] = None
     # Each group: list of bone object_ids ("Matrices { ... }" in MDL)
     groups_matrices: Optional[list[list[int]]] = None
+    uvs: Optional[list[tuple[float, float]]] = None
+    texture_name: Optional[str] = None
 
 
 class MeshProvider(Protocol):

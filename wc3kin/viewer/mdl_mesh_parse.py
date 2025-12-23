@@ -7,11 +7,15 @@ from pathlib import Path
 from typing import Iterable
 from .mesh_provider import MeshData
 
+_VEC2_RE = re.compile(r"\{\s*([-0-9.eE]+)\s*,\s*([-0-9.eE]+)\s*\}")
 _VEC3_RE = re.compile(r"\{\s*([-0-9.eE]+)\s*,\s*([-0-9.eE]+)\s*,\s*([-0-9.eE]+)\s*\}")
 _INT_RE = re.compile(r"-?\d+")
 
 def _read_text(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="replace")
+
+def _parse_vec2_list(block: str) -> list[tuple[float, float]]:
+    return [(float(a), float(b)) for (a, b) in _VEC2_RE.findall(block)]
 
 def _extract_block(text: str, name: str) -> list[str]:
     """
@@ -99,6 +103,21 @@ def parse_mdl_mesh(mdl_path: Path) -> MeshData:
         vertex_groups = _parse_ints(vg_blocks[0])
         # Some files may include count header; if mismatch, just keep what we got.
 
+    # TVertices / UVs (optional)
+    uvs = None
+    tv_blocks = _extract_block(g, "TVertices")
+    if tv_blocks:
+        uvs = _parse_vec2_list(tv_blocks[0])
+
+        # WC3 uses (u,v) with v typically top-down; OpenGL expects bottom-up.
+        # You can flip here OR in the renderer. I recommend flipping in renderer
+        # while prototyping; keep raw data intact for now.
+        # Example flip would be: uvs = [(u, 1.0 - v) for (u, v) in uvs]
+
+        # Basic sanity check: most models have same count
+        if len(uvs) != len(vertices):
+            print(f"[mdl_parse] WARNING: UV count ({len(uvs)}) != vertex count ({len(vertices)})")
+
     # Groups / Matrices (optional)
     groups_matrices = None
     groups_blocks = _extract_block(g, "Groups")
@@ -115,4 +134,5 @@ def parse_mdl_mesh(mdl_path: Path) -> MeshData:
         triangles=triangles,
         vertex_groups=vertex_groups,
         groups_matrices=groups_matrices,
+        uvs=uvs,
     )

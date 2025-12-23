@@ -37,6 +37,20 @@ try:
         glFlush,
         glTranslatef,
         glRotatef,
+        glTexCoord2f,
+        glBindTexture,
+        glGenTextures,
+        glTexImage2D,
+        glTexParameteri,
+        GL_TEXTURE_2D,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        GL_LINEAR,
+        GL_CLAMP_TO_EDGE,
+        GL_TEXTURE_MIN_FILTER,
+        GL_TEXTURE_MAG_FILTER,
+        GL_TEXTURE_WRAP_S,
+        GL_TEXTURE_WRAP_T,
         GL_TRIANGLES,
         GL_COLOR_BUFFER_BIT,
         GL_DEPTH_BUFFER_BIT,
@@ -211,6 +225,56 @@ class GLViewerFrame(tk.Frame):
                 self_inner._arcball_last = (0.0, 0.0, 1.0)
                 self_inner._mesh = None
                 self_inner._show_bones = True
+
+                # texture info
+                self_inner._tex_cache = {}   # key: resolved png path -> texture id
+                self_inner._active_tex_id = None
+
+            def _resolve_texture_png(self_inner, name: str) -> str:
+                # basename only, replace .blp -> .png, always from d:\all_textures
+                import os
+                base = os.path.basename(name)
+                if base.lower().endswith(".blp"):
+                    base = base[:-4] + ".png"
+                elif not base.lower().endswith(".png"):
+                    base = base + ".png"
+                return r"d:\all_textures\\" + base
+
+            def _get_texture_id(self_inner, tex_name: str) -> Optional[int]:
+                # Lazy-load and cache
+                if not tex_name:
+                    return None
+
+                path = self_inner._resolve_texture_png(tex_name)
+                if path in self_inner._tex_cache:
+                    return self_inner._tex_cache[path]
+
+                try:
+                    from PIL import Image
+                    import os
+
+                    if not os.path.exists(path):
+                        print(f"[viewer] texture missing: {path}")
+                        return None
+
+                    img = Image.open(path).convert("RGBA")
+                    w, h = img.size
+                    data = img.tobytes("raw", "RGBA", 0, -1)  # flip vertically so V works naturally in OpenGL
+
+                    tid = glGenTextures(1)
+                    glBindTexture(GL_TEXTURE_2D, tid)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+
+                    self_inner._tex_cache[path] = tid
+                    print(f"[viewer] loaded texture {path} ({w}x{h}) -> id={tid}")
+                    return tid
+                except Exception as e:
+                    print(f"[viewer] texture load failed: {path} err={e!r}")
+                    return None
 
             def set_show_bones(self_inner, show: bool) -> None:
                 show = bool(show)
@@ -463,23 +527,40 @@ class GLViewerFrame(tk.Frame):
 
                     verts = mesh.vertices
                     tris = mesh.triangles
+                    uvs = getattr(mesh, "uvs", None)
+                    tex_name = getattr(mesh, "texture_name", None)
+
                     vgroups = mesh.vertex_groups
                     gmat = mesh.groups_matrices
 
                     def bone_for_vertex(vid: int) -> Optional[int]:
-                        if not vgroups or not gmat:
+                        if vgroups is None or gmat is None:
                             return None
                         if vid < 0 or vid >= len(vgroups):
                             return None
+
                         gi = vgroups[vid]
                         if gi < 0 or gi >= len(gmat):
                             return None
+
                         mats = gmat[gi]
                         if not mats:
                             return None
+
                         return int(mats[0])
 
-                    glColor3f(0.35, 0.7, 0.35)
+                    tex_id = None
+                    if tex_name and uvs:
+                        tex_id = self_inner._get_texture_id(tex_name)
+
+                    if tex_id is not None:
+                        glEnable(GL_TEXTURE_2D)
+                        glBindTexture(GL_TEXTURE_2D, tex_id)
+                    else:
+                        glDisable(GL_TEXTURE_2D)
+
+                    glColor3f(1.0, 1.0, 1.0) if tex_id is not None else glColor3f(0.35, 0.7, 0.35)
+
                     glBegin(GL_TRIANGLES)
                     for (i0, i1, i2) in tris:
                         for vid in (i0, i1, i2):
@@ -487,8 +568,16 @@ class GLViewerFrame(tk.Frame):
                             bid = bone_for_vertex(vid)
                             if bid is not None and bid in pose.world_mats:
                                 v = transform_point(pose.world_mats[bid], v)
+
+                            if uvs and vid < len(uvs):
+                                u, vuv = uvs[vid]
+                                glTexCoord2f(float(u), float(vuv))
+
                             glVertex3f(float(v[0]), float(v[1]), float(v[2]))
                     glEnd()
+
+                    if tex_id is not None:
+                        glDisable(GL_TEXTURE_2D)
 
                 # --- BONES ---
                 if getattr(self_inner, "_show_bones", True):
