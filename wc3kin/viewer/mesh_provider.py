@@ -10,22 +10,32 @@ import re
 Vec3 = tuple[float, float, float]
 
 
-
-
 @dataclass(frozen=True)
 class MeshData:
-    # Bind-pose (model-space) vertex positions
     vertices: list[Vec3]
-    # Triangle vertex indices (triples)
     triangles: list[tuple[int, int, int]]
 
-    # Skinning (WC3 MDL-style)
-    # One entry per vertex: index into `groups_matrices`
     vertex_groups: Optional[list[int]] = None
-    # Each group: list of bone object_ids ("Matrices { ... }" in MDL)
     groups_matrices: Optional[list[list[int]]] = None
+
     uvs: Optional[list[tuple[float, float]]] = None
+
+    # Optional simple fallback (still useful)
     texture_name: Optional[str] = None
+
+    # NEW: material selection for THIS geoset (currently geoset[0])
+    geoset_material_id: Optional[int] = None
+
+    # NEW: textures table extracted from MDL Bitmaps
+    # each entry: {"image": "..."} or {"replaceable_id": 1}
+    textures: Optional[list[dict]] = None
+
+    # materials table extracted from MDL:
+    # each material: {"layers": [{"texture_id": 0, "filter_mode": "...", "alpha": 1.0, ...}, ...]}
+    materials: Optional[list[dict]] = None
+
+    # If present, this MeshData is a wrapper and actual renderable geosets are here
+    submeshes: Optional[list["MeshData"]] = None
 
 
 class MeshProvider(Protocol):
@@ -41,8 +51,14 @@ class MdlFileMeshProvider:
         self.mdl_path = mdl_path
 
     def load_mesh(self, *, con: sqlite3.Connection, unit_id: int) -> MeshData:
-        from .mdl_mesh_parse import parse_mdl_mesh
-        return parse_mdl_mesh(self.mdl_path)
+        from .mdl_mesh_parse import parse_mdl_mesh_all
+        meshes = parse_mdl_mesh_all(self.mdl_path)
+        if not meshes:
+            raise RuntimeError(f"No geosets parsed from {self.mdl_path}")
+        if len(meshes) == 1:
+            return meshes[0]
+        # Wrap multiple geosets so renderer/UI can toggle them
+        return MeshData(vertices=[], triangles=[], submeshes=list(meshes))
 
 
 class SqliteMeshProvider:

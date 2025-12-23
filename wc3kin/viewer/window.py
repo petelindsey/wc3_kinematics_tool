@@ -1,3 +1,4 @@
+#wc3kin/viewer/window.py
 from __future__ import annotations
 
 import tkinter as tk
@@ -49,6 +50,11 @@ class ViewerWindow(tk.Toplevel):
         #view bones off by default
         self.bones_var = tk.BooleanVar(value=False)
 
+        #number of player for team color
+        self.player_var = tk.IntVar(value=0)
+        self._geoset_vars = []  # list[tk.BooleanVar]
+        self._geosets_popup = None
+
         self.playing = False
         # loop off by default
         self.loop_var = tk.BooleanVar(value=False)
@@ -74,6 +80,11 @@ class ViewerWindow(tk.Toplevel):
         except Exception:
             pass
 
+        try:
+            self.gl.set_player_index(int(self.player_var.get()))
+        except Exception:
+            pass
+
         controls = ttk.Frame(top)
         controls.pack(fill="x", padx=8, pady=(0, 8))
 
@@ -94,6 +105,24 @@ class ViewerWindow(tk.Toplevel):
             command=self._on_toggle_bones,
         ).pack(side="left", padx=(12, 0))
 
+        ttk.Button(controls, text="Geosets", command=self._open_geosets_popup).pack(side="left", padx=(12, 0))
+
+        ttk.Label(controls, text="Player").pack(side="left", padx=(12, 0))
+
+        self.player_spin = ttk.Spinbox(
+            controls,
+            from_=0,
+            to=11,
+            width=3,
+            textvariable=self.player_var,
+            command=self._on_player_change,
+        )
+        self.player_spin.pack(side="left", padx=(4, 0))
+
+        # also handle typing + enter
+        self.player_spin.bind("<Return>", lambda _e: self._on_player_change())
+        self.player_spin.bind("<FocusOut>", lambda _e: self._on_player_change())
+
         self.time_lbl = ttk.Label(controls, text="t=0ms")
         self.time_lbl.pack(side="right")
 
@@ -106,6 +135,73 @@ class ViewerWindow(tk.Toplevel):
         self._render_current()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+
+    def _open_geosets_popup(self) -> None:
+        # Lazily build a popup with checkboxes for each geoset in the current mesh.
+        if self._mesh is None:
+            return
+        sub = getattr(self._mesh, "submeshes", None)
+        count = len(sub) if sub else 1
+
+        if self._geosets_popup is not None and self._geosets_popup.winfo_exists():
+            try:
+                self._geosets_popup.lift()
+            except Exception:
+                pass
+            return
+
+        top = tk.Toplevel(self)
+        top.title("Geosets")
+        top.resizable(False, True)
+        self._geosets_popup = top
+
+        # Ensure vars exist and default ON
+        self._geoset_vars = []
+        for i in range(count):
+            v = tk.BooleanVar(value=True)
+            self._geoset_vars.append(v)
+
+        frm = ttk.Frame(top, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        # All / None buttons
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(0, 8))
+        ttk.Button(btns, text="All", command=lambda: self._set_all_geosets(True)).pack(side="left")
+        ttk.Button(btns, text="None", command=lambda: self._set_all_geosets(False)).pack(side="left", padx=(6,0))
+
+        for i, v in enumerate(self._geoset_vars):
+            cb = ttk.Checkbutton(frm, text=f"Geoset {i}", variable=v, command=self._on_geoset_toggle)
+            cb.pack(anchor="w")
+
+        top.protocol("WM_DELETE_WINDOW", lambda: top.destroy())
+
+    def _set_all_geosets(self, val: bool) -> None:
+        for v in self._geoset_vars:
+            try:
+                v.set(bool(val))
+            except Exception:
+                pass
+        self._on_geoset_toggle()
+
+    def _on_geoset_toggle(self) -> None:
+        try:
+            enabled = [bool(v.get()) for v in self._geoset_vars]
+        except Exception:
+            enabled = None
+        if self.gl is not None:
+            try:
+                self.gl.set_enabled_geosets(enabled)
+            except Exception:
+                pass
+
+    def _on_player_change(self) -> None:
+        try:
+            if self.gl is not None:
+                self.gl.set_player_index(int(self.player_var.get()))
+        except Exception:
+            pass
 
     def _on_toggle_bones(self) -> None:
         try:
@@ -218,10 +314,17 @@ class ViewerWindow(tk.Toplevel):
                     f" vgroups={'yes' if m.vertex_groups else 'no'}"
                     f" groups_matrices={'yes' if m.groups_matrices else 'no'}"
                 )
+                print(
+                f"[viewer] mesh extras:"
+                f" uvs={'None' if getattr(m,'uvs',None) is None else len(getattr(m,'uvs'))}"
+                f" texture_name={getattr(m,'texture_name',None)!r}"
+                )
+
         except Exception as e:
             self._mesh = None
             print(f"[viewer] Mesh load failed (bones-only): {e!r}")
 
+        print(f"[viewer] extracted texture_name={getattr(self._mesh,'texture_name',None)!r}")
         print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
         print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size if mdl_path.exists() else 'n/a'}")
         m = self._mesh

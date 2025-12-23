@@ -15,7 +15,9 @@ except Exception as e:  # pragma: no cover
 else:
     _OPENGLFRAME_IMPORT_ERR = None
 
+import time
 from .mesh_provider import MeshData
+from PIL import Image
 
 try:
     from OpenGL.GL import (
@@ -23,6 +25,7 @@ try:
         glClear,
         glClearColor,
         glColor3f,
+        glColor4f,
         glEnd,
         glLineWidth,
         glLoadIdentity,
@@ -39,9 +42,19 @@ try:
         glRotatef,
         glTexCoord2f,
         glBindTexture,
+        glBlendFunc,
+        glAlphaFunc,
+        glDepthMask,
         glGenTextures,
         glTexImage2D,
         glTexParameteri,
+        GL_BLEND,
+        GL_ALPHA_TEST,
+        GL_SRC_ALPHA,
+        GL_ONE_MINUS_SRC_ALPHA,
+        GL_ONE,
+        GL_ZERO,
+        GL_DST_COLOR,
         GL_TEXTURE_2D,
         GL_RGBA,
         GL_UNSIGNED_BYTE,
@@ -61,7 +74,12 @@ try:
         GL_LINE_SMOOTH,
         GL_LINE_SMOOTH_HINT,
         GL_NICEST,
-    )
+        GL_GREATER,
+        glGetError,
+        GL_NO_ERROR,
+        glTexCoord2f,
+        )
+
 except Exception as e:  # pragma: no cover
     _PYOPENGL_IMPORT_ERR = e
 else:
@@ -212,6 +230,9 @@ class GLViewerFrame(tk.Frame):
             def __init__(self_inner, *args, **kwargs) -> None:
                 super().__init__(*args, **kwargs)
 
+                # for rendering the unit completely correctly
+                self_inner._player_index = 0
+
                 # camera defaults (safe even before GL init)
                 self_inner._cam_center = (0.0, 0.0, 0.0)
                 self_inner._cam_rot_q = (1.0, 0.0, 0.0, 0.0)  # identity
@@ -226,9 +247,198 @@ class GLViewerFrame(tk.Frame):
                 self_inner._mesh = None
                 self_inner._show_bones = True
 
+                # which geosets/submeshes are enabled (None => all)
+                self_inner._enabled_geosets = None
+
                 # texture info
                 self_inner._tex_cache = {}   # key: resolved png path -> texture id
                 self_inner._active_tex_id = None
+
+                #debug flags
+                self_inner._dbg_last_print = 0.0
+                self_inner._dbg_every_s = 1.0  # print at most once per second
+                self_inner._dbg_enabled = True  # flip to False when you’re done
+
+            def _get_texture_id_from_texture_entry(self_inner, entry: dict) -> Optional[int]:
+                """
+                Resolve a WC3 texture entry into an OpenGL texture ID.
+
+                entry formats:
+                  {"image": "Textures\\Units\\Foo.blp"}
+                  {"replaceable_id": 1}  # TeamColor
+                  {"replaceable_id": 2}  # TeamGlow
+                """
+                import os
+
+                if not entry or not isinstance(entry, dict):
+                    return None
+
+                # ---- determine PNG filename ----
+                png_name = None
+
+                # Replaceable textures (team color / glow)
+                if "replaceable_id" in entry:
+                    rid = int(entry.get("replaceable_id", -1))
+                    player = int(getattr(self_inner, "_player_index", 0))
+
+                    if rid == 1:
+                        png_name = f"TeamColor{player:02d}.png"
+                    elif rid == 2:
+                        png_name = f"TeamGlow{player:02d}.png"
+                    else:
+                        # Unknown replaceable — WC3 has more, but ignore for now
+                        return None
+
+                # Normal bitmap image
+                elif "image" in entry:
+                    base = os.path.basename(entry["image"])
+                    name, _ext = os.path.splitext(base)
+                    png_name = name + ".png"
+
+                if not png_name:
+                    return None
+
+                # ---- absolute path (your hard rule) ----
+                png_path = os.path.join(r"d:\all_textures", png_name)
+
+                # ---- texture cache ----
+                cache = getattr(self_inner, "_tex_cache", None)
+                if cache is None:
+                    cache = {}
+                    self_inner._tex_cache = cache
+
+                if png_path in cache:
+                    return cache[png_path]
+
+                # ---- load PNG & upload to OpenGL ----
+                if not os.path.exists(png_path):
+                    if not getattr(self_inner, "_warned_missing_tex", False):
+                        print(f"[viewer] texture not found: {png_path}")
+                        self_inner._warned_missing_tex = True
+                    return None
+
+                try:
+                    img = Image.open(png_path).convert("RGBA")
+                    w, h = img.size
+
+                    # Flip vertically: WC3 UVs expect this
+                    img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
+                    data = img.tobytes()
+
+                    tex_id = glGenTextures(1)
+                    glBindTexture(GL_TEXTURE_2D, tex_id)
+
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+                    glTexImage2D(
+                        GL_TEXTURE_2D,
+                        0,
+                        GL_RGBA,
+                        w,
+                        h,
+                        0,
+                        GL_RGBA,
+                        GL_UNSIGNED_BYTE,
+                        data,
+                    )
+
+                    cache[png_path] = tex_id
+                    print(f"[viewer] loaded texture {png_name} ({w}x{h})")
+                    return tex_id
+
+                except Exception as e:
+                    print(f"[viewer] FAILED loading texture {png_path}: {e!r}")
+                    return None
+
+            def _apply_filter_mode(self_inner, filter_mode: str, alpha: float) -> tuple[bool, bool]:
+                """
+                Apply WC3 FilterMode to fixed-function GL state.
+
+                Returns (blending_enabled, writes_depth).
+
+                Key behavior:
+                - FilterMode "None" is treated as an opaque pass, but we *alpha-test* to discard near-zero
+                texels. This prevents team-color / glow textures from painting as a flat grey overlay.
+                - Blended passes keep depth-test but disable depth-write (glDepthMask(False)).
+                """
+                fm = (filter_mode or "None").lower()
+
+                if fm in ("none",):
+                    glDisable(GL_BLEND)
+                    glEnable(GL_ALPHA_TEST)
+                    glAlphaFunc(GL_GREATER, 0.01)
+                    glDepthMask(True)
+                    return (False, True)
+
+                # blended passes
+                glDisable(GL_ALPHA_TEST)
+
+                if fm in ("transparent", "blend"):
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                    glDepthMask(False)
+                    return (True, False)
+
+                if fm in ("additive", "addalpha"):
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+                    glDepthMask(False)
+                    return (True, False)
+
+                if fm in ("modulate",):
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_DST_COLOR, GL_ZERO)  # multiply
+                    glDepthMask(False)
+                    return (True, False)
+
+                # fallback
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                glDepthMask(False)
+                return (True, False)
+
+
+            def _dbg(self_inner, msg: str) -> None:
+                if not getattr(self_inner, "_dbg_enabled", True):
+                    return
+                now = time.monotonic()
+                last = float(getattr(self_inner, "_dbg_last_print", 0.0))
+                every = float(getattr(self_inner, "_dbg_every_s", 1.0))
+                if now - last < every:
+                    return
+                self_inner._dbg_last_print = now
+                print(msg)
+
+            def _gl_check(self_inner, where: str) -> None:
+                err = glGetError()
+                if err != GL_NO_ERROR:
+                    # don’t throttle errors; they’re important
+                    print(f"[gl] ERROR {err} at {where}")
+
+            def set_player_index(self_inner, idx: int) -> None:
+                try:
+                    idx = int(idx)
+                except Exception:
+                    idx = 0
+                if idx < 0:
+                    idx = 0
+                if idx > 11:
+                    idx = 11
+                if idx == getattr(self_inner, "_player_index", 0):
+                    return
+                self_inner._player_index = idx
+                # if you cache textures, you may want to invalidate team textures here
+                self_inner.request_redraw()
+
+            def get_player_index(self_inner) -> int:
+                try:
+                    return int(getattr(self_inner, "_player_index", 0))
+                except Exception:
+                    return 0
 
             def _resolve_texture_png(self_inner, name: str) -> str:
                 # basename only, replace .blp -> .png, always from d:\all_textures
@@ -275,6 +485,20 @@ class GLViewerFrame(tk.Frame):
                 except Exception as e:
                     print(f"[viewer] texture load failed: {path} err={e!r}")
                     return None
+
+            def set_geosets_enabled(self_inner, enabled: Optional[list[bool]]) -> None:
+                self_inner._enabled_geosets = enabled
+                self_inner.request_redraw()
+
+            def get_geosets_enabled(self_inner) -> Optional[list[bool]]:
+                return getattr(self_inner, "_enabled_geosets", None)
+
+            # Preferred names (match window wiring)
+            def set_enabled_geosets(self_inner, enabled: Optional[list[bool]]) -> None:
+                self_inner.set_geosets_enabled(enabled)
+
+            def get_enabled_geosets(self_inner) -> Optional[list[bool]]:
+                return self_inner.get_geosets_enabled()
 
             def set_show_bones(self_inner, show: bool) -> None:
                 show = bool(show)
@@ -487,10 +711,36 @@ class GLViewerFrame(tk.Frame):
                 glLoadIdentity()
 
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                self_inner._gl_check("after glClear")
 
                 pose = getattr(self_inner, "_pose", None)
                 rig = getattr(self_inner, "_rig", None)
+                mesh = getattr(self_inner, "_mesh", None)
+
+                # lightweight state dump (throttled)
+                try:
+                    pose_ct = len(pose.world_pos) if pose is not None else 0
+                except Exception:
+                    pose_ct = -1
+
+                try:
+                    rig_ct = len(rig.bones) if rig is not None else 0
+                except Exception:
+                    rig_ct = -1
+
+                try:
+                    tri_ct = len(mesh.triangles) if mesh is not None else 0
+                    v_ct = len(mesh.vertices) if mesh is not None else 0
+                except Exception:
+                    tri_ct, v_ct = -1, -1
+
+                self_inner._dbg(
+                    f"[viewer] redraw w={w} h={h} pose_ct={pose_ct} rig_ct={rig_ct} mesh={'yes' if mesh else 'no'} "
+                    f"verts={v_ct} tris={tri_ct} cam_center={getattr(self_inner,'_cam_center',None)} dist={getattr(self_inner,'_cam_dist',None)}"
+                )
+
                 if pose is None or rig is None:
+                    self_inner._dbg("[viewer] redraw: pose or rig is None -> nothing to draw")
                     glFlush()
                     return
 
@@ -520,65 +770,160 @@ class GLViewerFrame(tk.Frame):
                     glRotatef(-float(angle_deg), float(axis[0]), float(axis[1]), float(axis[2]))
 
                 glTranslatef(-float(cx), -float(cy), -float(cz))
+                self_inner._gl_check("after camera transform")
+
+
 
                 mesh = getattr(self_inner, "_mesh", None)
-                if mesh is not None:
-                    from .evaluator import transform_point
 
-                    verts = mesh.vertices
-                    tris = mesh.triangles
-                    uvs = getattr(mesh, "uvs", None)
-                    tex_name = getattr(mesh, "texture_name", None)
+                # Support wrapper meshes that contain multiple geosets
+                meshes_to_draw = []
+                if mesh is not None and getattr(mesh, "submeshes", None):
+                    meshes_to_draw = list(getattr(mesh, "submeshes") or [])
+                elif mesh is not None:
+                    meshes_to_draw = [mesh]
 
-                    vgroups = mesh.vertex_groups
-                    gmat = mesh.groups_matrices
+                enabled = getattr(self_inner, "_enabled_geosets", None)
+                if enabled and len(enabled) == len(meshes_to_draw):
+                    meshes_to_draw = [m for m, ok in zip(meshes_to_draw, enabled) if ok]
 
-                    def bone_for_vertex(vid: int) -> Optional[int]:
-                        if vgroups is None or gmat is None:
-                            return None
-                        if vid < 0 or vid >= len(vgroups):
-                            return None
+                for mesh in meshes_to_draw:
+                    if mesh is None:
+                        continue
+                    try:
+                        from .evaluator import transform_point
 
-                        gi = vgroups[vid]
-                        if gi < 0 or gi >= len(gmat):
-                            return None
+                        verts = mesh.vertices
+                        tris = mesh.triangles
+                        uvs = getattr(mesh, "uvs", None)
+                        tex_name = getattr(mesh, "texture_name", None)
 
-                        mats = gmat[gi]
-                        if not mats:
-                            return None
+                        vgroups = mesh.vertex_groups
+                        gmat = mesh.groups_matrices
 
-                        return int(mats[0])
+                        def bones_for_vertex(vid: int) -> Optional[list[int]]:
+                            if vgroups is None or gmat is None:
+                                return None
+                            if vid < 0 or vid >= len(vgroups):
+                                return None
 
-                    tex_id = None
-                    if tex_name and uvs:
-                        tex_id = self_inner._get_texture_id(tex_name)
+                            gi = vgroups[vid]
+                            if gi < 0 or gi >= len(gmat):
+                                return None
 
-                    if tex_id is not None:
-                        glEnable(GL_TEXTURE_2D)
-                        glBindTexture(GL_TEXTURE_2D, tex_id)
-                    else:
-                        glDisable(GL_TEXTURE_2D)
+                            mats = gmat[gi]
+                            if not mats:
+                                return None
 
-                    glColor3f(1.0, 1.0, 1.0) if tex_id is not None else glColor3f(0.35, 0.7, 0.35)
+                            return [int(x) for x in mats]
 
-                    glBegin(GL_TRIANGLES)
-                    for (i0, i1, i2) in tris:
-                        for vid in (i0, i1, i2):
-                            v = verts[vid]
-                            bid = bone_for_vertex(vid)
-                            if bid is not None and bid in pose.world_mats:
-                                v = transform_point(pose.world_mats[bid], v)
+                        def skin_vertex(v: tuple[float, float, float], vid: int) -> tuple[float, float, float]:
+                            bids = bones_for_vertex(vid)
+                            if not bids:
+                                return v
 
-                            if uvs and vid < len(uvs):
-                                u, vuv = uvs[vid]
-                                glTexCoord2f(float(u), float(vuv))
+                            accx = accy = accz = 0.0
+                            n = 0
+                            for bid in bids:
+                                mtx = pose.world_mats.get(bid)
+                                if mtx is None:
+                                    continue
+                                tv = transform_point(mtx, v)
+                                accx += float(tv[0])
+                                accy += float(tv[1])
+                                accz += float(tv[2])
+                                n += 1
+                            if n <= 0:
+                                return v
+                            inv = 1.0 / float(n)
+                            return (accx * inv, accy * inv, accz * inv)
 
-                            glVertex3f(float(v[0]), float(v[1]), float(v[2]))
-                    glEnd()
+                        tex_id = None
+                        if tex_name and uvs:
+                            tex_id = self_inner._get_texture_id(tex_name)
 
-                    if tex_id is not None:
-                        glDisable(GL_TEXTURE_2D)
+                        if tex_id is not None:
+                            glEnable(GL_TEXTURE_2D)
+                            glBindTexture(GL_TEXTURE_2D, tex_id)
+                        else:
+                            glDisable(GL_TEXTURE_2D)
 
+                        uvs = getattr(mesh, "uvs", None)
+                        materials = getattr(mesh, "materials", None)
+                        textures = getattr(mesh, "textures", None)
+                        mid = getattr(mesh, "geoset_material_id", None)
+
+                        layers = None
+                        if (
+                            uvs is not None
+                            and materials is not None
+                            and textures is not None
+                            and mid is not None
+                            and 0 <= int(mid) < len(materials)
+                        ):
+                            layers = materials[int(mid)].get("layers") or None
+
+                        # fallback: if we don't have layers, keep old behavior (solid color)
+                        if not layers:
+                            glColor3f(0.35, 0.7, 0.35)
+                            glBegin(GL_TRIANGLES)
+                            for (i0, i1, i2) in tris:
+                                for vid in (i0, i1, i2):
+                                    v = verts[vid]
+                                    v = skin_vertex(v, vid)
+                                    glVertex3f(float(v[0]), float(v[1]), float(v[2]))
+                            glEnd()
+                        else:
+                            # Depth test ON for real mesh rendering
+                            glEnable(GL_DEPTH_TEST)
+
+                            for li, layer in enumerate(layers):
+                                tex_id = layer.get("texture_id", None)
+                                filter_mode = layer.get("filter_mode", "None")
+                                alpha = float(layer.get("alpha", 1.0) or 1.0)
+
+                                # ---- THIS IS THE IMPORTANT WIRING ----
+                                self_inner._apply_filter_mode(filter_mode, alpha)
+
+                                # resolve/bind texture for this layer (you implement this)
+                                glDisable(GL_TEXTURE_2D)
+                                tid = None
+                                if tex_id is not None and 0 <= int(tex_id) < len(textures):
+                                    tid = self_inner._get_texture_id_from_texture_entry(textures[int(tex_id)])
+                                if tid is not None:
+                                    glEnable(GL_TEXTURE_2D)
+                                    glBindTexture(GL_TEXTURE_2D, tid)
+
+                                # When textured, use white so the texture shows un-tinted
+                                glColor4f(1.0, 1.0, 1.0, float(alpha))
+
+                                glBegin(GL_TRIANGLES)
+                                for (i0, i1, i2) in tris:
+                                    for vid in (i0, i1, i2):
+                                        v = verts[vid]
+                                        v = skin_vertex(v, vid)
+
+                                        # UVs (flip V if needed later)
+                                        if uvs is not None and vid < len(uvs):
+                                            u, vv = uvs[vid]
+                                            glTexCoord2f(float(u), float(vv))
+
+                                        glVertex3f(float(v[0]), float(v[1]), float(v[2]))
+                                glEnd()
+
+                            # restore defaults after mesh
+                            glDisable(GL_TEXTURE_2D)
+                            glDisable(GL_BLEND)
+                            glDepthMask(True)
+                            glDisable(GL_DEPTH_TEST)
+
+                        if tex_id is not None:
+                            glDisable(GL_TEXTURE_2D)
+
+                    except Exception as e:
+                        print(f"[viewer] EXCEPTION during mesh draw: {e!r}")
+                self_inner._gl_check("after mesh draw")
+                
                 # --- BONES ---
                 if getattr(self_inner, "_show_bones", True):
                     active_ids = getattr(self_inner, "_active_ids", None)
@@ -609,6 +954,7 @@ class GLViewerFrame(tk.Frame):
                         print("WARNING: drew 0 bone edges (check parent_id wiring)")
                         self_inner._warned_zero_edges = True
 
+                self_inner._gl_check("after bone draw")
                 glFlush()
 
         self._impl = _Impl(self, width=640, height=480)
@@ -681,6 +1027,16 @@ class GLViewerFrame(tk.Frame):
         if self._impl is None:
             return
         self._impl._mesh = mesh
+
+    def set_enabled_geosets(self, enabled: Optional[list[bool]]) -> None:
+        if self._impl is None:
+            return
+        self._impl.set_enabled_geosets(enabled)
+
+    def get_enabled_geosets(self) -> Optional[list[bool]]:
+        if self._impl is None:
+            return None
+        return self._impl.get_enabled_geosets()
     
     def set_show_bones(self, show: bool) -> None:
         if self._impl is None:
@@ -691,3 +1047,13 @@ class GLViewerFrame(tk.Frame):
         if self._impl is None:
             return True
         return self._impl.get_show_bones()
+
+    def set_player_index(self, idx: int) -> None:
+        if self._impl is None:
+            return
+        self._impl.set_player_index(idx)
+
+    def get_player_index(self) -> int:
+        if self._impl is None:
+            return 0
+        return self._impl.get_player_index()
