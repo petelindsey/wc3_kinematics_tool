@@ -49,6 +49,8 @@ class ViewerWindow(tk.Toplevel):
         self.playing = False
         # loop off by default
         self.loop_var = tk.BooleanVar(value=False)
+        # bones on by default
+        self.bones_var = tk.BooleanVar(value=True)
 
         self.seq: Optional[SequenceDef] = None
         self.t_ms: int = 0
@@ -80,6 +82,13 @@ class ViewerWindow(tk.Toplevel):
 
         ttk.Checkbutton(controls, text="Loop", variable=self.loop_var).pack(side="left", padx=(12, 0))
 
+        ttk.Checkbutton(
+            controls,
+            text="Bones",
+            variable=self.bones_var,
+            command=self._on_toggle_bones,
+        ).pack(side="left", padx=(12, 0))
+
         self.time_lbl = ttk.Label(controls, text="t=0ms")
         self.time_lbl.pack(side="right")
 
@@ -92,6 +101,13 @@ class ViewerWindow(tk.Toplevel):
         self._render_current()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_toggle_bones(self) -> None:
+        try:
+            if self.gl is not None:
+                self.gl.set_show_bones(bool(self.bones_var.get()))
+        except Exception:
+            pass
 
     def _reset_camera(self) -> None:
         try:
