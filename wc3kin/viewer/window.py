@@ -73,7 +73,7 @@ class ViewerWindow(tk.Toplevel):
             self.gl.set_show_bones(bool(self.bones_var.get()))
         except Exception:
             pass
-        
+
         controls = ttk.Frame(top)
         controls.pack(fill="x", padx=8, pady=(0, 8))
 
@@ -85,7 +85,6 @@ class ViewerWindow(tk.Toplevel):
         self.pause_btn.pack(side="left", padx=(6, 0))
         self.rewind_btn.pack(side="left", padx=(6, 0))
 
-        ttk.Checkbutton(controls, text="Loop", variable=self.loop_var).pack(side="left", padx=(12, 0))
         ttk.Checkbutton(controls, text="Loop", variable=self.loop_var).pack(side="left", padx=(12, 0))
 
         ttk.Checkbutton(
