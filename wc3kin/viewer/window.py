@@ -18,6 +18,7 @@ from wc3kin.viewer.evaluator import build_rig_from_mdl_nodes
 
 from .view_persistence import ViewerPersist, default_persistence_path
 from .mesh_provider import MdlFileMeshProvider
+from .evaluator import build_anims_from_mdl
 
 class ViewerWindow(tk.Toplevel):
     """
@@ -46,6 +47,14 @@ class ViewerWindow(tk.Toplevel):
         self.units_root = units_root
         self.unit_id = int(unit_id)
         self.sequence_name = str(sequence_name)
+        # ---- Debug UI vars ----
+        self.dbg_alpha_off_var = tk.BooleanVar(value=False)
+        self.dbg_disable_textures_var = tk.BooleanVar(value=False)
+        self.dbg_color_by_tri_var = tk.BooleanVar(value=False)
+        self.dbg_prints_var = tk.BooleanVar(value=True)
+        self.dbg_flip_v_var = tk.BooleanVar(value=True)
+        self.teamcolor_mode_var = tk.StringVar(value="wc3_mask")
+        self.teamcolor_blend_var = tk.StringVar(value="layer")
 
         #view bones off by default
         self.bones_var = tk.BooleanVar(value=False)
@@ -75,6 +84,7 @@ class ViewerWindow(tk.Toplevel):
 
         self.gl = GLViewerFrame(top)
         self.gl.pack(fill="both", expand=True, padx=8, pady=8)
+        self._on_debug_flags_changed()
         try:
             self.gl.set_show_bones(bool(self.bones_var.get()))
         except Exception:
@@ -88,6 +98,78 @@ class ViewerWindow(tk.Toplevel):
         controls = ttk.Frame(top)
         controls.pack(fill="x", padx=8, pady=(0, 8))
 
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
+
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+
+        debug_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Debug", menu=debug_menu)
+
+        # Debug toggles
+        debug_menu.add_checkbutton(
+            label="Alpha Off (Force Opaque)",
+            variable=self.dbg_alpha_off_var,
+            command=self._on_debug_flags_changed,
+        )
+        debug_menu.add_checkbutton(
+            label="Disable Textures",
+            variable=self.dbg_disable_textures_var,
+            command=self._on_debug_flags_changed,
+        )
+        debug_menu.add_checkbutton(
+            label="Color By Triangle",
+            variable=self.dbg_color_by_tri_var,
+            command=self._on_debug_flags_changed,
+        )
+        debug_menu.add_checkbutton(
+            label="Flip V (UV)",
+            variable=self.dbg_flip_v_var,
+            command=self._on_debug_flags_changed,
+        )
+        debug_menu.add_separator()
+        debug_menu.add_checkbutton(
+            label="Debug Prints",
+            variable=self.dbg_prints_var,
+            command=self._on_debug_flags_changed,
+        )
+        debug_menu.add_separator()
+
+        team_menu = tk.Menu(debug_menu, tearoff=0)
+        debug_menu.add_cascade(label="TeamColor", menu=team_menu)
+
+        mode_menu = tk.Menu(team_menu, tearoff=0)
+        team_menu.add_cascade(label="Mode", menu=mode_menu)
+
+        for label, val in [
+            ("WC3 Mask (RGB=team, A=texA*alpha)", "wc3_mask"),
+            ("Modulate (RGB=tex*team)", "modulate"),
+            ("Replace RGB, Keep Alpha", "replace_rgb_keep_alpha"),
+            ("Off (treat as normal)", "off"),
+        ]:
+            mode_menu.add_radiobutton(
+                label=label,
+                variable=self.teamcolor_mode_var,
+                value=val,
+                command=self._on_debug_flags_changed,
+            )
+
+        blend_menu = tk.Menu(team_menu, tearoff=0)
+        team_menu.add_cascade(label="Blend", menu=blend_menu)
+
+        for label, val in [
+            ("Layer (material filter mode)", "layer"),
+            ("Force Alpha (SRC_A, 1-SRC_A)", "alpha"),
+            ("Force Add (SRC_A, ONE)", "add"),
+            ("None (no blend/test)", "none"),
+        ]:
+            blend_menu.add_radiobutton(
+                label=label,
+                variable=self.teamcolor_blend_var,
+                value=val,
+                command=self._on_debug_flags_changed,
+            )
         self.play_btn = ttk.Button(controls, text="Play", command=self._on_play)
         self.pause_btn = ttk.Button(controls, text="Pause", command=self._on_pause)
         self.rewind_btn = ttk.Button(controls, text="Rewind", command=self._on_rewind)
@@ -176,6 +258,49 @@ class ViewerWindow(tk.Toplevel):
             cb.pack(anchor="w")
 
         top.protocol("WM_DELETE_WINDOW", lambda: top.destroy())
+
+    def _on_debug_flags_changed(self) -> None:
+        """Push debug flags into GL widget and redraw."""
+        try:
+            if self.gl is None:
+                return
+
+            # existing flags
+            try:
+                self.gl.set_debug_alpha_off(bool(self.dbg_alpha_off_var.get()))
+            except Exception:
+                pass
+            try:
+                self.gl.set_debug_disable_textures(bool(self.dbg_disable_textures_var.get()))
+            except Exception:
+                pass
+            try:
+                self.gl.set_debug_color_by_tri(bool(self.dbg_color_by_tri_var.get()))
+            except Exception:
+                pass
+            try:
+                self.gl.set_debug_enabled(bool(self.dbg_prints_var.get()))
+            except Exception:
+                pass
+
+            # NEW: UV debug
+            try:
+                self.gl.set_debug_flip_v(bool(self.dbg_flip_v_var.get()))
+            except Exception:
+                pass
+
+            # NEW: TeamColor debug
+            try:
+                self.gl.set_teamcolor_mode(str(self.teamcolor_mode_var.get()))
+            except Exception:
+                pass
+            try:
+                self.gl.set_teamcolor_blend(str(self.teamcolor_blend_var.get()))
+            except Exception:
+                pass
+
+        except Exception:
+            pass
 
     def _set_all_geosets(self, val: bool) -> None:
         for v in self._geoset_vars:
@@ -267,10 +392,15 @@ class ViewerWindow(tk.Toplevel):
         print("load from db called")
         self._mesh = None
         self._mesh_provider = None
+
         seq = dbmod.get_sequence_detail(self.con, self.unit_id, self.sequence_name)
         if seq is None:
             raise RuntimeError(f"Sequence not found in DB for unit_id={self.unit_id}: {self.sequence_name}")
         self.seq = seq
+        self._seq_start_ms = int(seq.start_ms)
+        self._seq_end_ms = int(seq.end_ms)
+        self._seq_dur_ms = self._seq_end_ms - self._seq_start_ms
+        
         self.t_ms = int(seq.start_ms)
 
         bones_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "bones")
@@ -292,12 +422,15 @@ class ViewerWindow(tk.Toplevel):
         if not mdl_path.exists():
             print(f"MDL path does not exist on disk: {mdl_path}")
             raise RuntimeError(f"MDL path does not exist on disk: {mdl_path}")
-        
+
+        print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
+        print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size}")
+
+        # ---------------------------------------------------------------------
+        # REAL MESH LOAD: parse MDL from disk (DB mesh not implemented yet)
+        # ---------------------------------------------------------------------
         try:
             from .mesh_provider import MdlFileMeshProvider
-
-            print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
-            print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size}")
 
             self._mesh_provider = MdlFileMeshProvider(mdl_path=mdl_path)
             self._mesh = self._mesh_provider.load_mesh(con=self.con, unit_id=self.unit_id)
@@ -308,93 +441,114 @@ class ViewerWindow(tk.Toplevel):
                 self.gl.set_mesh(self._mesh)
 
                 m = self._mesh
+                sub_ct = len(m.submeshes) if getattr(m, "submeshes", None) else 0
                 print(
                     "[viewer] Mesh loaded:"
                     f" verts={len(m.vertices)} tris={len(m.triangles)}"
+                    f" submeshes={sub_ct}"
                     f" vgroups={'yes' if m.vertex_groups else 'no'}"
                     f" groups_matrices={'yes' if m.groups_matrices else 'no'}"
                 )
                 print(
-                f"[viewer] mesh extras:"
-                f" uvs={'None' if getattr(m,'uvs',None) is None else len(getattr(m,'uvs'))}"
-                f" texture_name={getattr(m,'texture_name',None)!r}"
+                    f"[viewer] mesh extras:"
+                    f" uvs={'None' if getattr(m,'uvs',None) is None else len(getattr(m,'uvs'))}"
+                    f" texture_name={getattr(m,'texture_name',None)!r}"
+                    f" textures_ct={0 if getattr(m,'textures',None) is None else len(m.textures)}"
+                    f" materials_ct={0 if getattr(m,'materials',None) is None else len(m.materials)}"
                 )
+
+                # If wrapper has submeshes, print a quick per-geoset summary
+                if sub_ct:
+                    for i, sm in enumerate(m.submeshes[:10]):  # cap spam
+                        print(
+                            f"[viewer]   geoset[{i}] verts={len(sm.vertices)} tris={len(sm.triangles)}"
+                            f" mat_id={getattr(sm,'geoset_material_id',None)}"
+                            f" uvs={'None' if getattr(sm,'uvs',None) is None else len(sm.uvs)}"
+                            f" vgroups={'yes' if sm.vertex_groups else 'no'}"
+                            f" gmat={'yes' if sm.groups_matrices else 'no'}"
+                        )
+                    if sub_ct > 10:
+                        print(f"[viewer]   ... {sub_ct-10} more geosets")
 
         except Exception as e:
             self._mesh = None
             print(f"[viewer] Mesh load failed (bones-only): {e!r}")
 
-        print(f"[viewer] extracted texture_name={getattr(self._mesh,'texture_name',None)!r}")
-        print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
-        print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size if mdl_path.exists() else 'n/a'}")
-        m = self._mesh
-        if m is not None:
-            print(
-                "[viewer] Mesh loaded:"
-                f" verts={len(m.vertices)} tris={len(m.triangles)}"
-                f" vgroups={'yes' if m.vertex_groups else 'no'}"
-                f" groups_matrices={'yes' if m.groups_matrices else 'no'}"
-            )
-            if m.vertex_groups:
-                print(f"[viewer] vertex_groups count={len(m.vertex_groups)} min={min(m.vertex_groups)} max={max(m.vertex_groups)}")
-            if m.groups_matrices:
-                nonempty = sum(1 for g in m.groups_matrices if g)
-                maxlen = max((len(g) for g in m.groups_matrices), default=0)
-                print(f"[viewer] groups_matrices count={len(m.groups_matrices)} nonempty={nonempty} max_group_len={maxlen}")
-
-        self._mesh_provider = MdlFileMeshProvider(mdl_path=mdl_path)
-        self._mesh = self._mesh_provider.load_mesh(con=self.con, unit_id=self.unit_id)
-
-        # pass mesh into GL widget so redraw can render it
-        self.gl.set_mesh(self._mesh)
-
-
+        # --- Build Nodes and Rig ---
         print("Building Nodes and Rig")
         nodes_by_id = load_nodes_from_mdl(mdl_path)
         rig = build_rig_from_mdl_nodes(nodes_by_id)
 
-        anims = build_anims_from_boneanims_json(boneanims_json)
+        anims = build_anims_from_mdl(mdl_path)
 
         # --- DEBUG: do boneanim key times line up with sequence times? ---
         self._time_offset = 0
         print("Building All Times")
-        all_times = []
-        for ch in anims.values():
-            all_times.extend([k.time_ms for k in ch.translation])
-            all_times.extend([k.time_ms for k in ch.rotation])
-            all_times.extend([k.time_ms for k in ch.scaling])
-        print("Checking if All Times is empty")
+        all_times: list[int] = []
         try:
-            if all_times:
-                keys_min, keys_max = min(all_times), max(all_times)
-                seq_dur = int(self.seq.end_ms - self.seq.start_ms)
+            for ch in anims.values():
+                all_times.extend([int(k.time_ms) for k in ch.translation])
+                all_times.extend([int(k.time_ms) for k in ch.rotation])
+                all_times.extend([int(k.time_ms) for k in ch.scaling])
+        except Exception:
+            all_times = []
 
-                if keys_min >= 0 and keys_max <= seq_dur + 2 and int(self.seq.start_ms) != 0:
-                    self._time_offset = int(self.seq.start_ms)
-                    print(f"[viewer] using relative key times; offset={self._time_offset}ms")
+        try:
+            seq_start = int(self.seq.start_ms)
+            seq_end = int(self.seq.end_ms)
+            seq_dur = int(seq_end - seq_start)
+
+            times_in_abs = [t for t in all_times if seq_start <= t <= seq_end]
+            times_in_rel = [t for t in all_times if 0 <= t <= seq_dur]
+
+            # If there are no keys in the absolute window for this sequence, but there ARE keys
+            # in the relative window, treat keys as relative and subtract the sequence start.
+            if (not times_in_abs) and times_in_rel and seq_start != 0:
+                self._time_offset = seq_start
+                print(f"[viewer] using RELATIVE key times for this sequence; offset={self._time_offset}ms")
+            else:
+                self._time_offset = 0
+                if times_in_abs:
+                    print(f"[viewer] using ABSOLUTE key times for this sequence; keys_in_window={len(times_in_abs)}")
+            self._time_offset = 0
             print(
-                f"[viewer] seq={self.seq.name} start={self.seq.start_ms} end={self.seq.end_ms} "
-                f"dur={int(self.seq.end_ms - self.seq.start_ms)}"
+                f"[viewer] seq={self.seq.name} start={seq_start} end={seq_end} dur={seq_dur}"
             )
-            print(
-                f"[viewer] key_times: empty={not bool(all_times)}"
-                + (f" min={min(all_times)} max={max(all_times)} count={len(all_times)}" if all_times else "")
-            )
+            if all_times:
+                print(
+                    f"[viewer] key_times: min={min(all_times)} max={max(all_times)} count={len(all_times)} "
+                    f"| in_abs={len(times_in_abs)} in_rel={len(times_in_rel)}"
+                )
+            else:
+                print("[viewer] key_times: EMPTY (no animation keys parsed)")
         except Exception as e:
-            print(f"Load From DB Error:{e}")
+            print(f"[viewer] time-domain detection failed: {e!r}")
+
 
         self._rig = rig
         self._evaluator = UnitAnimEvaluator(rig=rig, anims=anims)
 
+        # Store seq window for per-channel sampling
+        self._seq_start_ms = int(self.seq.start_ms)
+        self._seq_end_ms = int(self.seq.end_ms)
+        self._seq_dur_ms = int(self._seq_end_ms - self._seq_start_ms)
+
+        # Use a stable time for bind pose; avoid (0,0,0)
+        bind_pose = self._evaluator.evaluate_pose(self._seq_start_ms, self._seq_start_ms, self._seq_dur_ms)
+        self.gl.set_bind_pose(bind_pose)
+
+
+
     def _render_current(self) -> None:
-        if self._evaluator is None or self._rig is None:
+        if self._evaluator is None or self._rig is None or self.seq is None:
             return
 
-        offset = int(getattr(self, "_time_offset", 0))
-        t_sample = self.t_ms - offset
+        # Use absolute timeline time; evaluator will decide per-channel whether to use abs or rel.
+        t_abs = int(self.t_ms)
+        seq_start = int(self.seq.start_ms)
+        seq_dur = int(self.seq.end_ms - self.seq.start_ms)
 
-        # NOTE: if you intended to use offset sampling, switch to evaluate_pose(t_sample)
-        pose = self._evaluator.evaluate_pose(self.t_ms)
+        pose = self._evaluator.evaluate_pose(t_abs, seq_start, seq_dur)
 
         # First render: restore persisted camera or do a default fit
         if not self._cam_init_done:
@@ -414,4 +568,5 @@ class ViewerWindow(tk.Toplevel):
             self._cam_init_done = True
 
         self.gl.set_pose(pose, self._rig, active_ids=None)
-        self.time_lbl.config(text=f"t={self.t_ms}ms")
+
+        self.time_lbl.config(text=f"t={t_abs}ms")

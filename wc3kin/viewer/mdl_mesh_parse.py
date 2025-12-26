@@ -6,6 +6,10 @@ import re
 from pathlib import Path
 from typing import Iterable
 from .mesh_provider import MeshData
+import json
+from pathlib import Path
+from typing import Any
+
 
 #_VEC2_RE = re.compile(r"\{\s*([-0-9.eE]+)\s*,\s*([-0-9.eE]+)\s*\}")
 _VEC3_RE = re.compile(r"\{\s*([-0-9.eE]+)\s*,\s*([-0-9.eE]+)\s*,\s*([-0-9.eE]+)\s*\}")
@@ -156,15 +160,28 @@ def _parse_groups_matrices(geoset_block: str):
     return vertex_groups, groups_matrices
 
 
+                            
 def _parse_faces_to_tris(geoset_block: str):
-    m = re.search(r"(?i)\bFaces\b", geoset_block)
-    if not m:
+
+    # WC3 MDL typically nests indices under:
+    #   Faces ... { Triangles ... { {i,j,k}, ... } }
+    m_faces = re.search(r"(?i)\bFaces\b", geoset_block)
+    if not m_faces:
         return []
-    brace = geoset_block.find("{", m.end())
-    if brace == -1:
+    brace_faces = geoset_block.find("{", m_faces.end())
+    if brace_faces == -1:
         return []
-    inner = _slice_brace(geoset_block, brace)
-    ints = [int(x) for x in _INT_RE.findall(inner)]
+    faces_inner = _slice_brace(geoset_block, brace_faces)
+
+    m_tri = re.search(r"(?i)\bTriangles\b", faces_inner)
+    if not m_tri:
+        return []
+    brace_tri = faces_inner.find("{", m_tri.end())
+    if brace_tri == -1:
+        return []
+    tri_inner = _slice_brace(faces_inner, brace_tri)
+
+    ints = [int(x) for x in _INT_RE.findall(tri_inner)]
     tris = []
     for i in range(0, len(ints) - 2, 3):
         tris.append((ints[i], ints[i + 1], ints[i + 2]))
@@ -265,7 +282,56 @@ def extract_geoset_texture_name(mdl_text: str, geoset_index: int = 0):
     # basename only; ignore directories (your rule)
     return os.path.basename(images[tex_id])
 
-def parse_mdl_mesh_all(mdl_path: Path):
+
+def export_mesh_truth_json(
+    out_path: Path,
+    *,
+    geoset_index: int,
+    vertices: list[tuple[float, float, float]],
+    triangles: list[tuple[int, int, int]],
+    uvs: list[tuple[float, float]],
+    extra: dict[str, Any] | None = None,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    idxs = [i for tri in triangles for i in tri]
+    max_i = max(idxs) if idxs else -1
+    min_i = min(idxs) if idxs else -1
+
+    payload = {
+        "geoset_index": geoset_index,
+        "counts": {
+            "verts": len(vertices),
+            "tris": len(triangles),
+            "uvs": len(uvs),
+        },
+        "index_stats": {
+            "min": int(min_i),
+            "max": int(max_i),
+            "in_range": bool(max_i <= len(vertices) - 1 and min_i >= 0),
+        },
+        "bbox": {
+            "min": [
+                min(v[0] for v in vertices) if vertices else 0.0,
+                min(v[1] for v in vertices) if vertices else 0.0,
+                min(v[2] for v in vertices) if vertices else 0.0,
+            ],
+            "max": [
+                max(v[0] for v in vertices) if vertices else 0.0,
+                max(v[1] for v in vertices) if vertices else 0.0,
+                max(v[2] for v in vertices) if vertices else 0.0,
+            ],
+        },
+        "vertices": vertices,
+        "triangles": triangles,
+        "uvs": uvs,
+        "extra": extra or {},
+    }
+
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+def parse_mdl_mesh_all(mdl_path):
+    mdl_path = Path(mdl_path)
     text = _read_text(mdl_path)
     geosets = _extract_blocks(text, "Geoset")
     if not geosets:
@@ -284,6 +350,15 @@ def parse_mdl_mesh_all(mdl_path: Path):
 
         vertex_groups, groups_matrices = _parse_groups_matrices(g)
         triangles = _parse_faces_to_tris(g)
+        if gi == 3:
+            export_mesh_truth_json(
+                Path("debug_exports") / "viewer_parse_geoset3.json",
+                geoset_index=gi,
+                vertices=vertices,
+                triangles=triangles,
+                uvs=uvs,
+                extra={"source": str(mdl_path)},
+            )
 
         texture_name = extract_geoset_texture_name(text, geoset_index=gi)
 
@@ -300,6 +375,7 @@ def parse_mdl_mesh_all(mdl_path: Path):
                 materials=materials_table,
             )
         )
+
     return out
 
 def parse_mdl_mesh(mdl_path: Path) -> MeshData:

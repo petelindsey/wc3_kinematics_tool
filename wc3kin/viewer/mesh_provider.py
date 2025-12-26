@@ -44,19 +44,19 @@ class MeshProvider(Protocol):
 
 
 class MdlFileMeshProvider:
-    """
-    Current path: load from the MDL on disk. Later you can switch to DB provider.
-    """
     def __init__(self, *, mdl_path: Path) -> None:
-        self.mdl_path = mdl_path
+        self.mdl_path = Path(mdl_path)  # normalize
 
     def load_mesh(self, *, con: sqlite3.Connection, unit_id: int) -> MeshData:
         from .mdl_mesh_parse import parse_mdl_mesh_all
-        meshes = parse_mdl_mesh_all(self.mdl_path)
+
+        meshes = parse_mdl_mesh_all(self.mdl_path)  # <-- pass Path, not str
         if not meshes:
             raise RuntimeError(f"No geosets parsed from {self.mdl_path}")
+
         if len(meshes) == 1:
             return meshes[0]
+
         # Wrap multiple geosets so renderer/UI can toggle them
         return MeshData(vertices=[], triangles=[], submeshes=list(meshes))
 
@@ -71,8 +71,21 @@ class SqliteMeshProvider:
         self.table = table
 
     def load_mesh(self, *, con: sqlite3.Connection, unit_id: int) -> MeshData:
-        # TODO: implement when DB schema exists.
-        # Example idea:
-        #   SELECT mdl_text FROM unit_mdls WHERE unit_id = ?
-        # and then parse from string instead of file.
-        raise NotImplementedError("SqliteMeshProvider not wired yet")
+        # Loud, unmistakable placeholder: a single big triangle
+        return MeshData(
+            vertices=[(0.0, 0.0, 0.0), (150.0, 0.0, 0.0), (0.0, 150.0, 0.0)],
+            triangles=[(0, 1, 2)],
+            uvs=[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+            texture_name=None,
+        )
+
+class DebugMeshProvider:
+    """Returns a known placeholder mesh to prove which pipeline is active."""
+    def load_mesh(self, **kwargs) -> MeshData:
+        # Big triangle in front of camera; unmistakable
+        return MeshData(
+            vertices=[(0.0, 0.0, 0.0), (200.0, 0.0, 0.0), (0.0, 200.0, 0.0)],
+            triangles=[(0, 1, 2)],
+            uvs=[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+            texture_name=None,
+        )

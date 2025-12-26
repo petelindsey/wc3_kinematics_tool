@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 
 # local config / db (adjust to your needs)
+wc3_kinematics.sqlite.viewer_persistence.json
 config.json
 *.sqlite
 *.db
