@@ -106,6 +106,38 @@ except Exception as e:  # pragma: no cover
 else:
     _PYOPENGL_IMPORT_ERR = None
 
+def _pose_world_pos_iter(pose):
+    """
+    Support Pose.world_pos being either:
+      - dict {bone_id: (x,y,z)}
+      - list [(x,y,z), ...] where index == bone_id
+    Yields (bone_id, (x,y,z)).
+    """
+    wp = getattr(pose, "world_pos", None)
+    if wp is None:
+        return []
+    if hasattr(wp, "items"):
+        return list(wp.items())
+    # list/tuple
+    out = []
+    for i, p in enumerate(wp):
+        if p is None:
+            continue
+        out.append((i, p))
+    return out
+
+
+def _pose_world_pos_get(pose, bone_id: int):
+    wp = getattr(pose, "world_pos", None)
+    if wp is None:
+        return None
+    if hasattr(wp, "get"):
+        return wp.get(bone_id)
+    # list/tuple
+    if 0 <= bone_id < len(wp):
+        return wp[bone_id]
+    return None
+
 def _iter_pose_positions(world_pos):
     """
     Accepts either:
@@ -1033,9 +1065,10 @@ class GLViewerFrame(tk.Frame):
                             world_mats = getattr(pose, "world_mats", None) or {}
 
                             n = 0
-                            accx = accy = accz = 0.0
-                            for bid in bids:
+                            # WC3 SD-style: rigid skinning (use one matrix, not blended weights)
+                            for bid in reversed(bids):
                                 mtx = world_mats.get(bid) or world_mats.get(str(bid))
+
                                 invb = inv_bind.get(bid)
                                 if invb is None:
                                     try:
@@ -1047,18 +1080,10 @@ class GLViewerFrame(tk.Frame):
                                     continue
 
                                 skin_mtx = self_inner._mat4_mul(mtx, invb)
-                                tv = transform_point(skin_mtx, v)
+                                return transform_point(skin_mtx, v)
 
-                                accx += tv[0]
-                                accy += tv[1]
-                                accz += tv[2]
-                                n += 1
-
-                            if n <= 0:
-                                return v
-
-                            invn = 1.0 / n
-                            return (accx * invn, accy * invn, accz * invn)
+                            # no valid bone matrix found
+                            return v        
 
                         materials = getattr(submesh, "materials", None)
                         textures = getattr(submesh, "textures", None)
@@ -1193,22 +1218,32 @@ class GLViewerFrame(tk.Frame):
                         traceback.print_exc()
 
                 # --- BONES ---
-                if getattr(self_inner, "_show_bones", True):
+                if getattr(self_inner, "_show_bones", True) and rig is not None and pose is not None:
                     glLineWidth(2.0)
-                    glBegin(GL_LINES)
-                    for oid, b in rig.bones.items():
-                        pid = b.parent_id
-                        if pid is None or pid not in rig.bones:
-                            continue
-                        p0 = pose.world_pos.get(pid)
-                        p1 = pose.world_pos.get(oid)
-                        if p0 is None or p1 is None:
-                            continue
 
-                        glColor3f(0.7, 0.7, 0.9)
-                        glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
-                        glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
-                    glEnd()
+                    began = False
+                    try:
+                        glBegin(GL_LINES)
+                        began = True
+
+                        # rig.parent: {child_id: parent_id or None}
+                        for oid in getattr(rig, "ids", []):
+                            pid = rig.parent.get(oid)
+                            if pid is None:
+                                continue
+
+                            p0 = _pose_world_pos_get(pose, int(pid))
+                            p1 = _pose_world_pos_get(pose, int(oid))
+                            if p0 is None or p1 is None:
+                                continue
+
+                            glColor3f(0.7, 0.7, 0.9)
+                            glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
+                            glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
+
+                    finally:
+                        if began:
+                            glEnd()
 
                 glFlush()
 
