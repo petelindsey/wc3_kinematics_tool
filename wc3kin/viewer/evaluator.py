@@ -292,6 +292,7 @@ class UnitAnimEvaluator:
 
             #return mat4_mul(Tt, mat4_mul(Tp, mat4_mul(R, mat4_mul(S, Tn))))
             return mat4_mul(Tp, mat4_mul(Tt, mat4_mul(R, mat4_mul(S, Tn))))
+            
 
         def compute_world(nid: int, stack: Optional[set[int]] = None) -> Mat4:
             if nid in world_mats:
