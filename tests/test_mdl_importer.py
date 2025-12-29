@@ -6,12 +6,14 @@ PROJECT_ROOT = os.path.abspath("D:\wc3_kinematics_tool")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from wc3kin.wc3mdl.parse_mdl import parse_mdl_file
-from wc3kin.wc3mdl.build_model import build_model_from_raw
+from wc3kin.wc3mdl.parse_mdl import parse_mdl_file, parse_mdl
+from wc3kin.wc3mdl.build_model import build_model_from_raw, build_model
 from wc3kin.wc3mdl.normalize_clips import normalize_sequence_clip
 from wc3kin.wc3mdl.model import Model
 from wc3kin.wc3mdl.eval import evaluate_pose, build_skin_matrices
 from wc3kin.wc3mdl.validate import run_validation
+
+
 
 # Path to the attached Archer.mdl
 ARCHER_MDL = "D:\\wc3_all_assets\\Units\\NightElf\\Archer\\Archer.mdl"
@@ -188,3 +190,31 @@ def test_validation_no_errors():
     errs = run_validation(model)
     assert isinstance(errs, list)
     assert not errs, f"Unexpected validation errors: {errs}"
+
+
+
+def test_structure():
+    ast = parse_mdl("Archer.mdl")
+    model = build_model(ast)
+
+    # Nodes
+    assert model.nodes, "No nodes parsed"
+
+    for node_id, node in model.nodes.items():
+        if node.parent is not None:
+            assert node.parent in model.nodes, (
+                f"Bone {node_id} has invalid parent {node.parent}"
+            )
+
+    # Sequences
+    assert model.sequences, "No sequences parsed"
+
+    for name, seq in model.sequences.items():
+        assert seq.duration > 0, f"Sequence {name} has zero duration"
+
+        for bone_id in seq.bone_anims:
+            assert bone_id in model.nodes, (
+                f"Sequence {name} references missing bone {bone_id}"
+            )
+
+    print("STRUCTURE TEST PASSED")

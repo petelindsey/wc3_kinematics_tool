@@ -1064,11 +1064,11 @@ class GLViewerFrame(tk.Frame):
                             inv_bind = getattr(self_inner, "_inv_bind_world", None) or {}
                             world_mats = getattr(pose, "world_mats", None) or {}
 
-                            n = 0
-                            # WC3 SD-style: rigid skinning (use one matrix, not blended weights)
-                            for bid in reversed(bids):
-                                mtx = world_mats.get(bid) or world_mats.get(str(bid))
+                            acc = [0.0, 0.0, 0.0]
+                            cnt = 0
 
+                            for bid in bids:
+                                mtx = world_mats.get(bid) or world_mats.get(str(bid))
                                 invb = inv_bind.get(bid)
                                 if invb is None:
                                     try:
@@ -1080,10 +1080,16 @@ class GLViewerFrame(tk.Frame):
                                     continue
 
                                 skin_mtx = self_inner._mat4_mul(mtx, invb)
-                                return transform_point(skin_mtx, v)
+                                x, y, z = transform_point(skin_mtx, v)
+                                acc[0] += x
+                                acc[1] += y
+                                acc[2] += z
+                                cnt += 1
 
-                            # no valid bone matrix found
-                            return v        
+                            if cnt > 0:
+                                return (acc[0] / cnt, acc[1] / cnt, acc[2] / cnt)
+
+                            return v
 
                         materials = getattr(submesh, "materials", None)
                         textures = getattr(submesh, "textures", None)

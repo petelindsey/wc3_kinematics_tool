@@ -20,6 +20,12 @@ from .view_persistence import ViewerPersist, default_persistence_path
 from .mesh_provider import MdlFileMeshProvider
 from .evaluator import build_anims_from_mdl
 
+from wc3kin.wc3mdl.import_mdl import import_mdl
+
+from wc3kin.viewer.evaluator import build_rig_from_imported_model, build_anims_for_sequence
+from wc3kin.wc3mdl import query as mdlq
+from .evaluator import Pose, mat4_identity, transform_point
+
 class ViewerWindow(tk.Toplevel):
     """
     Minimal viewer:
@@ -48,7 +54,7 @@ class ViewerWindow(tk.Toplevel):
         self.unit_id = int(unit_id)
         self.sequence_name = str(sequence_name)
         # ---- Debug UI vars ----
-        self.dbg_alpha_off_var = tk.BooleanVar(value=False)
+        self.dbg_alpha_off_var = tk.BooleanVar(value=True)
         self.dbg_disable_textures_var = tk.BooleanVar(value=False)
         self.dbg_color_by_tri_var = tk.BooleanVar(value=False)
         self.dbg_prints_var = tk.BooleanVar(value=True)
@@ -302,6 +308,22 @@ class ViewerWindow(tk.Toplevel):
         except Exception:
             pass
 
+    def _make_neutral_bind_pose(self):
+        world_mats = {}
+        # identity for every node id in rig
+        for nid in self._rig.ids:
+            world_mats[nid] = mat4_identity()
+
+        # optional: positions for bone drawing
+        max_id = max(self._rig.ids) if self._rig.ids else -1
+        world_pos = [(0.0, 0.0, 0.0)] * (max_id + 1 if max_id >= 0 else 0)
+        for nid in self._rig.ids:
+            pv = self._rig.pivot.get(nid, (0.0, 0.0, 0.0))
+            if nid < len(world_pos):
+                world_pos[nid] = transform_point(world_mats[nid], pv)
+
+        return Pose(world_mats=world_mats, world_pos=world_pos)
+
     def _set_all_geosets(self, val: bool) -> None:
         for v in self._geoset_vars:
             try:
@@ -357,8 +379,15 @@ class ViewerWindow(tk.Toplevel):
         self.destroy()
 
     def _on_play(self) -> None:
-        if self._evaluator is None or self.seq is None:
+        if self._evaluator is None:
+            print('Evaluator is None')
             return
+        
+        if not hasattr(self, "_seq_start_ms") or not hasattr(self, "_seq_end_ms"):
+        
+            print('No Start and / or Stop cannot animate')
+            return
+        
         if not self.playing:
             self.playing = True
             self._tick()
@@ -371,52 +400,64 @@ class ViewerWindow(tk.Toplevel):
             return
         self.t_ms = int(self.seq.start_ms)
         self._render_current()
+    
+    def _on_rewind(self) -> None:
+        if not hasattr(self, "_seq_start_ms"):
+            return
+        self.t_ms = int(self._seq_start_ms)
+        self._render_current()
 
     def _tick(self) -> None:
-        if not self.playing or self.seq is None or self._evaluator is None:
+        
+        if not self.playing or self._evaluator is None:
+            print('Self .Playing Not set')
+            return
+
+        if self._evaluator is None:
+            print('Evaluator is None, Cannot Animate')
+            return
+        
+        # Need a valid sequence window from ImportedModel
+        if not hasattr(self, "_seq_start_ms") or not hasattr(self, "_seq_end_ms"):
+            print('Start and/or Stop Not Defined, cannot animate')
             return
 
         self.t_ms += self.TICK_MS
-        if self.t_ms > self.seq.end_ms:
+
+        seq_start = int(self._seq_start_ms)
+        seq_end = int(self._seq_end_ms)
+
+        if self.t_ms > seq_end:
             if self.loop_var.get():
-                self.t_ms = int(self.seq.start_ms)
+                self.t_ms = seq_start
             else:
                 # stop + auto-rewind
-                self.t_ms = int(self.seq.start_ms)
+                self.t_ms = seq_start
                 self.playing = False
 
         self._render_current()
         self.after(self.TICK_MS, self._tick)
-
+        
     def _load_from_db(self) -> None:
         print("load from db called")
         self._mesh = None
         self._mesh_provider = None
+        self._mdl = None  # ImportedModel (wc3mdl) stored for alpha/geosets/etc.
 
-        seq = dbmod.get_sequence_detail(self.con, self.unit_id, self.sequence_name)
-        if seq is None:
-            raise RuntimeError(f"Sequence not found in DB for unit_id={self.unit_id}: {self.sequence_name}")
-        self.seq = seq
-        self._seq_start_ms = int(seq.start_ms)
-        self._seq_end_ms = int(seq.end_ms)
-        self._seq_dur_ms = self._seq_end_ms - self._seq_start_ms
-        
-        self.t_ms = int(seq.start_ms)
-
+        # ---------------------------------------------------------------------------------
+        # 0) Resolve mdl_path from DB (keep this part since your UI/DB points to mdl)
+        # ---------------------------------------------------------------------------------
         bones_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "bones")
-        boneanims_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "boneanims")
-        print("processing bones json")
-        if bones_json is None or boneanims_json is None:
+        if bones_json is None:
             raise RuntimeError(
-                "Missing harvested JSON blobs in DB.\n"
-                "Expected kinds: 'bones' and 'boneanims'.\n"
-                "Use blob ingest (best-effort) before opening viewer."
+                "Missing harvested JSON blob in DB: kind='bones'.\n"
+                "Expected bones blob to contain at least {'mdl': <path>}."
             )
 
         mdl_path_str = bones_json.get("mdl")
         if not mdl_path_str:
-            print("bones_json missing 'mdl' path; cannot load MDL for viewer rig.")
-            raise RuntimeError("bones_json missing 'mdl' path; cannot load MDL for viewer rig.")
+            print("bones_json missing 'mdl' path; cannot load MDL for viewer.")
+            raise RuntimeError("bones_json missing 'mdl' path; cannot load MDL for viewer.")
         mdl_path = Path(mdl_path_str)
 
         if not mdl_path.exists():
@@ -426,9 +467,9 @@ class ViewerWindow(tk.Toplevel):
         print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
         print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size}")
 
-        # ---------------------------------------------------------------------
-        # REAL MESH LOAD: parse MDL from disk (DB mesh not implemented yet)
-        # ---------------------------------------------------------------------
+        # ---------------------------------------------------------------------------------
+        # 1) Load mesh from disk (unchanged)
+        # ---------------------------------------------------------------------------------
         try:
             from .mesh_provider import MdlFileMeshProvider
 
@@ -457,7 +498,6 @@ class ViewerWindow(tk.Toplevel):
                     f" materials_ct={0 if getattr(m,'materials',None) is None else len(m.materials)}"
                 )
 
-                # If wrapper has submeshes, print a quick per-geoset summary
                 if sub_ct:
                     for i, sm in enumerate(m.submeshes[:10]):  # cap spam
                         print(
@@ -474,81 +514,186 @@ class ViewerWindow(tk.Toplevel):
             self._mesh = None
             print(f"[viewer] Mesh load failed (bones-only): {e!r}")
 
-        # --- Build Nodes and Rig ---
-        print("Building Nodes and Rig")
-        nodes_by_id = load_nodes_from_mdl(mdl_path)
-        rig = build_rig_from_mdl_nodes(nodes_by_id)
 
-        anims = build_anims_from_mdl(mdl_path)
 
-        # --- DEBUG: do boneanim key times line up with sequence times? ---
-        self._time_offset = 0
-        print("Building All Times")
-        all_times: list[int] = []
-        try:
-            for ch in anims.values():
-                all_times.extend([int(k.time_ms) for k in ch.translation])
-                all_times.extend([int(k.time_ms) for k in ch.rotation])
-                all_times.extend([int(k.time_ms) for k in ch.scaling])
-        except Exception:
-            all_times = []
+        print("[viewer] importing MDL via wc3mdl.import_mdl ...")
+        self._mdl = import_mdl(str(mdl_path))
 
-        try:
-            seq_start = int(self.seq.start_ms)
-            seq_end = int(self.seq.end_ms)
-            seq_dur = int(seq_end - seq_start)
-
-            times_in_abs = [t for t in all_times if seq_start <= t <= seq_end]
-            times_in_rel = [t for t in all_times if 0 <= t <= seq_dur]
-
-            # If there are no keys in the absolute window for this sequence, but there ARE keys
-            # in the relative window, treat keys as relative and subtract the sequence start.
-            if (not times_in_abs) and times_in_rel and seq_start != 0:
-                self._time_offset = seq_start
-                print(f"[viewer] using RELATIVE key times for this sequence; offset={self._time_offset}ms")
-            else:
-                self._time_offset = 0
-                if times_in_abs:
-                    print(f"[viewer] using ABSOLUTE key times for this sequence; keys_in_window={len(times_in_abs)}")
-            self._time_offset = 0
-            print(
-                f"[viewer] seq={self.seq.name} start={seq_start} end={seq_end} dur={seq_dur}"
+        # Find sequence by name in the imported model (authoritative)
+        seq = next((s for s in self._mdl.sequences if s.name == self.sequence_name), None)
+        if seq is None:
+            available = [s.name for s in self._mdl.sequences]
+            raise RuntimeError(
+                f"Sequence not found in imported model: {self.sequence_name!r}\n"
+                f"Available sequences: {available}"
             )
-            if all_times:
-                print(
-                    f"[viewer] key_times: min={min(all_times)} max={max(all_times)} count={len(all_times)} "
-                    f"| in_abs={len(times_in_abs)} in_rel={len(times_in_rel)}"
-                )
-            else:
-                print("[viewer] key_times: EMPTY (no animation keys parsed)")
-        except Exception as e:
-            print(f"[viewer] time-domain detection failed: {e!r}")
 
+        # Store sequence timing (absolute)
+        self._seq_start_ms = int(seq.start_abs)
+        self._seq_end_ms = int(seq.end_abs)
+        self._seq_dur_ms = int(seq.dur)
+        self.t_ms = int(seq.start_abs)
 
+        print(
+            f"[viewer] seq={seq.name!r} start={self._seq_start_ms} end={self._seq_end_ms} dur={self._seq_dur_ms}"
+        )
+
+        # --- rig once ---
+        rig = build_rig_from_imported_model(self._mdl)
+
+        # --- playback anims (current sequence) ---
+        play_anims = build_anims_for_sequence(self._mdl, seq.name)
         self._rig = rig
-        self._evaluator = UnitAnimEvaluator(rig=rig, anims=anims)
+        self._evaluator = UnitAnimEvaluator(rig=rig, anims=play_anims)
 
-        # Store seq window for per-channel sampling
-        self._seq_start_ms = int(self.seq.start_ms)
-        self._seq_end_ms = int(self.seq.end_ms)
-        self._seq_dur_ms = int(self._seq_end_ms - self._seq_start_ms)
+        # --- bind pose anims (prefer Stand) ---
+        bind_seq = next((s for s in self._mdl.sequences if s.name == "Stand"), None)
+        if bind_seq is None:
+            bind_seq = seq  # fallback
 
-        # Use a stable time for bind pose; avoid (0,0,0)
-        bind_pose = self._evaluator.evaluate_pose(self._seq_start_ms, self._seq_start_ms, self._seq_dur_ms)
+        bind_anims = build_anims_for_sequence(self._mdl, bind_seq.name)
+        bind_eval = UnitAnimEvaluator(rig=rig, anims=bind_anims)
+
+        bind_start = int(bind_seq.start_abs)
+        bind_dur = int(bind_seq.dur)
+
+        #bind_pose = bind_eval.evaluate_pose(bind_start, bind_start, bind_dur)
+        bind_pose = self._make_neutral_bind_pose()
         self.gl.set_bind_pose(bind_pose)
+        
+        
 
+        print(
+            f"[viewer] bind_pose set from {bind_seq.name!r} "
+            f"at t_abs={bind_start} (dur={bind_dur})"
+        )
 
+        # --- start playback cursor at CURRENT seq start ---
+        self.t_ms = int(seq.start_abs)
+        self._render_current()
+        # ---------------------------------------------------------------------------------
+        # 5) (Optional) You can print a quick geoset/geosetanim summary here
+        # ---------------------------------------------------------------------------------
+        try:
+            ga_ct = len(getattr(self._mdl, "geoset_anims", {}) or {})
+            gs_ct = len(getattr(self._mdl, "geosets", []) or [])
+            print(f"[viewer] ImportedModel geosets={gs_ct} geoset_anims={ga_ct}")
+        except Exception:
+            pass
+
+        rig_ids = set(self._rig.ids)
+
+        def _collect_influence_ids(mesh) -> set[int]:
+            ids: set[int] = set()
+            if mesh is None:
+                return ids
+
+            def add_from_vgroups(vgroups):
+                if not vgroups:
+                    return
+
+                # Case A: per-vertex single int (very common): [3,3,3,4,4,...]
+                if isinstance(vgroups, (list, tuple)) and vgroups and isinstance(vgroups[0], int):
+                    ids.update(int(x) for x in vgroups)
+                    return
+
+                # Otherwise treat as per-vertex "influence list"
+                for infl_list in vgroups:
+                    if infl_list is None:
+                        continue
+
+                    # Case B: each entry is int
+                    if isinstance(infl_list, int):
+                        ids.add(int(infl_list))
+                        continue
+
+                    # Case C: dict influence
+                    if isinstance(infl_list, dict):
+                        for k in ("id", "bone", "bone_id", "group", "matrix"):
+                            if k in infl_list:
+                                try:
+                                    ids.add(int(infl_list[k]))
+                                except Exception:
+                                    pass
+                                break
+                        continue
+
+                    # Case D: tuple like (id, weight)
+                    if isinstance(infl_list, tuple):
+                        if len(infl_list) >= 1:
+                            try:
+                                ids.add(int(infl_list[0]))
+                            except Exception:
+                                pass
+                        continue
+
+                    # Case E: list/tuple of influences
+                    if isinstance(infl_list, (list, tuple)):
+                        for infl in infl_list:
+                            if isinstance(infl, int):
+                                ids.add(int(infl))
+                            elif isinstance(infl, tuple) and len(infl) >= 1:
+                                try:
+                                    ids.add(int(infl[0]))
+                                except Exception:
+                                    pass
+                            elif isinstance(infl, dict):
+                                for k in ("id", "bone", "bone_id", "group", "matrix"):
+                                    if k in infl:
+                                        try:
+                                            ids.add(int(infl[k]))
+                                        except Exception:
+                                            pass
+                                        break
+                    else:
+                        # unknown scalar type, ignore
+                        pass
+
+            add_from_vgroups(getattr(mesh, "vertex_groups", None))
+            for sm in (getattr(mesh, "submeshes", None) or []):
+                add_from_vgroups(getattr(sm, "vertex_groups", None))
+
+            return ids
+
+        inf_ids = _collect_influence_ids(self._mesh)
+
+        print("[dbg] influence ids:", len(inf_ids))
+        print("[dbg] influence not in rig:", sorted(list(inf_ids - rig_ids))[:50])
+        print("[dbg] rig not referenced by influence:", sorted(list(rig_ids - inf_ids))[:50])
 
     def _render_current(self) -> None:
-        if self._evaluator is None or self._rig is None or self.seq is None:
+        if self._evaluator is None or self._rig is None or self._mdl is None:
             return
 
-        # Use absolute timeline time; evaluator will decide per-channel whether to use abs or rel.
+        # Absolute timeline cursor (used for geoset alpha + for deriving t_rel)
         t_abs = int(self.t_ms)
-        seq_start = int(self.seq.start_ms)
-        seq_dur = int(self.seq.end_ms - self.seq.start_ms)
 
+        # Sequence timing should come from ImportedModel (_load_from_db set these)
+        seq_start = int(self._seq_start_ms)
+        seq_dur = int(self._seq_dur_ms)
+
+        # Evaluate pose: evaluator should sample bone channels with t_rel = t_abs - seq_start
         pose = self._evaluator.evaluate_pose(t_abs, seq_start, seq_dur)
+
+        # Geoset visibility: absolute-time alpha + user checkbox
+        enabled = []
+        geosets = getattr(self._mdl, "geosets", []) or []
+        geoset_anims = getattr(self._mdl, "geoset_anims", {}) or {}
+
+        for gid in range(len(geosets)):
+            user_on = True
+            if self._geoset_vars:
+                try:
+                    user_on = bool(self._geoset_vars[gid].get())
+                except Exception:
+                    user_on = True
+
+            ga = geoset_anims.get(gid)
+            a = 1.0 if ga is None else mdlq.eval_geoset_alpha(ga, t_abs)
+
+            enabled.append(user_on and (a > 0.01))
+
+        self.gl.set_enabled_geosets(enabled)
 
         # First render: restore persisted camera or do a default fit
         if not self._cam_init_done:
@@ -563,10 +708,10 @@ class ViewerWindow(tk.Toplevel):
             else:
                 self.gl.fit_camera_to_pose(pose)
 
-            # snapshot default camera (for Ctrl+R)
             self.gl.snapshot_default_camera()
             self._cam_init_done = True
 
+        # Single pose submit (don’t call twice)
         self.gl.set_pose(pose, self._rig, active_ids=None)
 
         self.time_lbl.config(text=f"t={t_abs}ms")

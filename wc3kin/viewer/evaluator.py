@@ -230,6 +230,16 @@ def build_rig_from_mdl_nodes(nodes_by_id: Dict[int, dict]) -> Rig:
 
     return Rig(parent=parent, pivot=pivot, ids=ids)
 
+def build_rig_from_imported_model(imported) -> Rig:
+    parent = {}
+    pivot = {}
+    ids = sorted(imported.nodes.keys())
+    for nid in ids:
+        n = imported.nodes[nid]
+        parent[nid] = n.parent_id
+        pivot[nid] = n.pivot
+    return Rig(parent=parent, pivot=pivot, ids=ids)
+
 
 class UnitAnimEvaluator:
     def __init__(self, *, rig: Rig, anims: Dict[int, AnimChannel]) -> None:
@@ -246,6 +256,19 @@ class UnitAnimEvaluator:
         world_pos: List[Vec3] = [(0.0, 0.0, 0.0)] * (max_id + 1 if max_id >= 0 else 0)
 
         t_rel_ms = int(t_abs_ms) - int(seq_start_ms)
+        if t_abs_ms == seq_start_ms:
+            print("[dbg] evaluator domain check:", "t_abs=", t_abs_ms, "t_rel=", t_rel_ms, "dur=", seq_dur_ms)
+        t_abs_ms = int(t_abs_ms)
+        seq_start_ms = int(seq_start_ms)
+        seq_dur_ms = int(seq_dur_ms)
+
+        if t_rel_ms < 0:
+            print(f'T-Relavite is Below 0')
+            t_rel_ms = 0
+        elif t_rel_ms > seq_dur_ms:
+            t_rel_ms = seq_dur_ms
+
+        
 
         def local_mat_for(nid: int) -> Mat4:
             ch = self.anims.get(nid)
@@ -255,14 +278,7 @@ class UnitAnimEvaluator:
             sc = (1.0, 1.0, 1.0)
 
             if ch is not None:
-                # Decide per-channel time domain (mixed abs/rel exists in Archer)
-                use_rel = False
-                for ks in (ch.translation, ch.rotation, ch.scaling):
-                    if ks and int(ks[-1].time_ms) <= int(seq_dur_ms) + 2:
-                        use_rel = True
-                        break
-                t_ch = t_rel_ms if use_rel else int(t_abs_ms)
-
+                t_ch = int(t_rel_ms)  # <-- always relative for bone channels
                 tr = _sample_keys_linear(ch.translation, t_ch, tr)
                 ro = _sample_keys_linear(ch.rotation, t_ch, ro)
                 sc = _sample_keys_linear(ch.scaling, t_ch, sc)
@@ -290,8 +306,9 @@ class UnitAnimEvaluator:
             R = quat_to_mat4((qx, qy, qz, qw))
             S = mat4_scale(sx, sy, sz)
 
-            #return mat4_mul(Tt, mat4_mul(Tp, mat4_mul(R, mat4_mul(S, Tn))))
+            ##return mat4_mul(Tt, mat4_mul(Tp, mat4_mul(R, mat4_mul(S, Tn))))
             return mat4_mul(Tp, mat4_mul(Tt, mat4_mul(R, mat4_mul(S, Tn))))
+            #return mat4_mul(Tp, mat4_mul(R, mat4_mul(S, mat4_mul(Tn, Tt))))
             
 
         def compute_world(nid: int, stack: Optional[set[int]] = None) -> Mat4:
@@ -323,7 +340,9 @@ class UnitAnimEvaluator:
         for nid in self.rig.ids:
             w = compute_world(nid)
             if nid < len(world_pos):
-                world_pos[nid] = transform_point(w, (0.0, 0.0, 0.0))
+                pv = self.rig.pivot.get(nid, (0.0, 0.0, 0.0))
+                world_pos[nid] = transform_point(w, pv)
+                #world_pos[nid] = transform_point(w, (0.0, 0.0, 0.0))
 
         return Pose(world_mats=world_mats, world_pos=world_pos)
 
@@ -517,6 +536,26 @@ def _parse_keyframes_vec(track_block: str, n: int) -> List["Keyframe"]:
         if len(vals) >= n:
             out.append(Keyframe(time_ms=t, value=tuple(vals[:n])))
     out.sort(key=lambda k: k.time_ms)
+    return out
+
+def build_anims_for_sequence(imported, seq_name: str) -> Dict[int, AnimChannel]:
+    seq = next(s for s in imported.sequences if s.name == seq_name)
+    out: Dict[int, AnimChannel] = {}
+
+    for bone_id, ba in seq.bone_anims.items():
+        tr = []
+        ro = []
+        sc = []
+
+        if ba.translation:
+            tr = [Keyframe(time_ms=k.t, value=k.value) for k in ba.translation.keys]
+        if ba.rotation:
+            ro = [Keyframe(time_ms=k.t, value=k.value) for k in ba.rotation.keys]
+        if ba.scaling:
+            sc = [Keyframe(time_ms=k.t, value=k.value) for k in ba.scaling.keys]
+
+        out[bone_id] = AnimChannel(translation=tr, rotation=ro, scaling=sc)
+
     return out
 
 def build_anims_from_mdl(mdl_path: Union[str, Path]) -> Dict[int, "AnimChannel"]:

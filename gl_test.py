@@ -1,69 +1,80 @@
 from __future__ import annotations
 
-import tkinter as tk
+import os
+from pathlib import Path
 
-from pyopengltk import OpenGLFrame
-from OpenGL.GL import (
-    glBegin, glClear, glClearColor, glColor3f, glEnd, glFlush, glLineWidth,
-    glLoadIdentity, glMatrixMode, glOrtho, glVertex2f, glViewport,
-    glGetString, GL_VERSION, GL_RENDERER, GL_VENDOR,
-    GL_COLOR_BUFFER_BIT, GL_LINES, GL_MODELVIEW, GL_PROJECTION,
-)
+import pytest
 
-class TestFrame(OpenGLFrame):
-    def initgl(self) -> None:
-        # If you see these prints, the GL context is actually created.
-        try:
-            print("GL_VENDOR  :", glGetString(GL_VENDOR))
-            print("GL_RENDERER:", glGetString(GL_RENDERER))
-            print("GL_VERSION :", glGetString(GL_VERSION))
-        except Exception as e:
-            print("glGetString failed:", repr(e))
+from wc3kin.wc3mdl.import_mdl import import_mdl
+from wc3kin.wc3mdl.parse_mdl import parse_mdl
 
-        glClearColor(0.05, 0.05, 0.08, 1.0)
 
-    def redraw(self) -> None:
-        w = max(self.winfo_width(), 1)
-        h = max(self.winfo_height(), 1)
-        glViewport(0, 0, w, h)
+def _archer_path() -> Path:
+    p = r"D:\wc3_all_assets\Units\NightElf\Archer\Archer.mdl"
+    path = Path(p)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return path
 
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        glOrtho(-1, 1, -1, 1, -1, 1)
 
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
+def test_importer_sequences_restored():
+    p = _archer_path()
+    m = import_mdl(str(p))
 
-        glClear(GL_COLOR_BUFFER_BIT)
+    assert len(m.sequences) == 13
+    names = [s.name for s in m.sequences]
+    for n in ["Death", "Decay Flesh", "Decay Bone"]:
+        assert n in names
 
-        glLineWidth(6.0)
-        glBegin(GL_LINES)
+    assert len(m.geosets) == 4
+    # geoset_anims is a dict[int, GeosetAnim]
+    assert len(m.geoset_anims) == 4
 
-        # red horizontal
-        glColor3f(1.0, 0.0, 0.0)
-        glVertex2f(-0.9, 0.0)
-        glVertex2f(0.9, 0.0)
 
-        # green vertical
-        glColor3f(0.0, 1.0, 0.0)
-        glVertex2f(0.0, -0.9)
-        glVertex2f(0.0, 0.9)
+def test_geosetanim_alpha_key_ranges():
+    p = _archer_path()
+    m = import_mdl(str(p))
 
-        glEnd()
-        glFlush()
+    # expected (from your confirmed output)
+    expected = {
+        0: (1, 199333, 199333, 1),
+        1: (1, 199333, 199333, 1),
+        2: (19, 167, 199333, 19),
+        3: (15, 167, 259333, 15),
+    }
 
-def main() -> None:
-    root = tk.Tk()
-    root.title("pyopengltk smoke test (animate loop)")
-    root.geometry("800x600")
+    for gid, (nkeys, tmin, tmax, gsid) in expected.items():
+        ga = m.geoset_anims[gid]
+        keys = ga.alpha.keys if ga.alpha else []
+        ts = [k.t for k in keys]
+        assert len(keys) == nkeys
+        assert (min(ts), max(ts)) == (tmin, tmax)
+        assert ga.global_seq_id == gsid
 
-    frame = TestFrame(root, width=800, height=600)
-    frame.pack(fill="both", expand=True)
 
-    # This is the key: let pyopengltk drive redraws.
-    frame.animate = 1
+def test_queries_death_decay_semantics():
+    p = _archer_path()
+    m = import_mdl(str(p))
 
-    root.mainloop()
+    from wc3kin.wc3mdl import query
 
-if __name__ == "__main__":
-    main()
+    assert query.geosets_affected_in_sequence(m, "Death") == [2, 3]
+    assert query.geosets_affected_in_sequence(m, "Decay Flesh") == [2, 3]
+    assert query.geosets_affected_in_sequence(m, "Decay Bone") == [0, 1, 2, 3]
+
+    assert query.geosets_hidden_at_end(m, "Death") == [2, 3]
+    assert query.geosets_hidden_at_end(m, "Decay Flesh") == [2]
+    assert query.geosets_hidden_at_end(m, "Decay Bone") == [0, 1, 2, 3]
+
+
+def test_parser_sequences_block_present():
+    p = _archer_path()
+    ast = parse_mdl(str(p))
+
+    seq_blocks = [b for b in ast if b.type == "Sequences"]
+    assert len(seq_blocks) >= 1
+
+    # Expect 13 Anim blocks under the first Sequences block
+    sb = seq_blocks[0]
+    anims = [x for x in sb.body if getattr(x, "type", None) == "Anim"]
+    assert len(anims) == 13
