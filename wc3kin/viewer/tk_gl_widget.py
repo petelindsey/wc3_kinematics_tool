@@ -1390,8 +1390,6 @@ class GLViewerFrame(tk.Frame):
 
                 glFlush()
 
-
-
             def capture_image(self_inner) -> Image.Image:
                 """Read the current framebuffer into a PIL RGBA image."""
                 w = int(self_inner.winfo_width())
@@ -1413,8 +1411,6 @@ class GLViewerFrame(tk.Frame):
                 data = glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE)
                 img = Image.frombytes("RGBA", (w, h), data)
                 return img.transpose(Image.FLIP_TOP_BOTTOM)
-
-
         self._impl = _Impl(self, width=640, height=480)
         self._impl.pack(fill="both", expand=True)
 
@@ -1605,8 +1601,7 @@ class GLViewerFrame(tk.Frame):
         if self._impl is None:
             return "layer"
         return str(getattr(self._impl, "_dbg_teamcolor_blend", "layer"))
-
-    # ---- export helpers ----
+        # ---- export helpers ----
     def capture_image(self) -> Optional[Image.Image]:
         """Capture the current OpenGL framebuffer into a PIL image.
 

@@ -1,0 +1,9 @@
+{
+  "geometry": "980x720+613+124",
+  "race": "Human",
+  "unit": "Arthas",
+  "anim": "Attack - 1",
+  "show_death": true,
+  "json_only": true,
+  "force_update": false
+}

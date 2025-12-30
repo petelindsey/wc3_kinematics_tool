@@ -754,7 +754,7 @@ class ViewerPanel(ttk.Frame):
 
         print("[viewer] importing MDL via wc3mdl.import_mdl ...")
         self._mdl = import_mdl(str(mdl_path))
-
+        self._mdl_path=mdl_path
         seq = next((s for s in self._mdl.sequences if s.name == self.sequence_name), None)
         if seq is None:
             available = [s.name for s in self._mdl.sequences]
@@ -978,6 +978,7 @@ class ViewerPanel(ttk.Frame):
             unit = mdl_path.parent.name or mdl_path.stem
         else:
             # best-effort fallback using window title / selector
+            print(f'Could not determine unit info from path:{mdl_path}')
             try:
                 unit = getattr(self, "_unit_name", "unit")
             except Exception:
@@ -1165,6 +1166,7 @@ class ViewerPanel(ttk.Frame):
             self.w_var = tk.StringVar(value="")
             self.h_var = tk.StringVar(value="")
             self.fps_var = tk.StringVar(value="30")
+            self._mdl_path=''
 
             seq = viewer._seq
             seq_start = float(getattr(seq, 'start_abs', 0))
@@ -1233,9 +1235,17 @@ class ViewerPanel(ttk.Frame):
         def _sync_default_name(self) -> None:
             fmt = (self.fmt_var.get() or "gif").lower()
             default_name = self.viewer._derive_default_export_name(fmt)
-            if not self.path_var.get():
-                # Put it in cwd by default; Save As will override
+
+            cur = (self.path_var.get() or "").strip()
+            if not cur:
                 self.path_var.set(str(Path.cwd() / default_name))
+                return
+
+            p = Path(cur)
+            # If the user hasn't opened Save As, they’re likely using the auto-name:
+            # keep their chosen directory, but sync the extension to the selected format.
+            new_path = p.with_suffix(f".{fmt}")
+            self.path_var.set(str(new_path))
 
         def _choose_out(self) -> None:
             fmt = (self.fmt_var.get() or "gif").lower()
