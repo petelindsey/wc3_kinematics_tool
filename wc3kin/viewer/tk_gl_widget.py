@@ -53,6 +53,9 @@ try:
         GL_SRC_COLOR,
         glGetBooleanv,
         glDepthFunc,
+        glColorMask,
+        GL_TRUE,
+        GL_FALSE,
         glIsEnabled,
         GL_ALPHA_TEST,
         GL_DEPTH_WRITEMASK,
@@ -617,9 +620,20 @@ class GLViewerFrame(tk.Frame):
                         GL_UNSIGNED_BYTE,
                         data,
                     )
+                    
                     a_min, a_max = img.getchannel("A").getextrema()
-                    if "TeamColor" in png_name or "TeamGlow" in png_name:
+
+                    # Cache alpha extrema for later render decisions (depth prepass for Blend)
+                    m = getattr(self_inner, "_tex_alpha_extrema", None)
+                    if m is None:
+                        m = {}
+                        self_inner._tex_alpha_extrema = m
+                    m[int(tex_id)] = (int(a_min), int(a_max))
+
+                    # Log alpha extrema when debug is enabled (helps validate MDL assumptions)
+                    if getattr(self_inner, "_dbg_enabled", True):
                         self_inner._dbg(f"[tex] {png_name} alpha extrema: min={a_min} max={a_max}")
+
                     cache[png_path] = tex_id
                     print(f"[viewer] loaded texture {png_name} ({w}x{h})")
                     return tex_id
@@ -627,6 +641,17 @@ class GLViewerFrame(tk.Frame):
                 except Exception as e:
                     print(f"[viewer] FAILED loading texture {png_path}: {e!r}")
                     return None
+
+            def _tex_has_any_transparency(self_inner, tid: Optional[int]) -> bool:
+                if tid is None:
+                    return False
+                m = getattr(self_inner, "_tex_alpha_extrema", None) or {}
+                mm = m.get(int(tid))
+                if not mm:
+                    return False
+                a_min, a_max = mm
+                # "mixed" alpha or cutouts
+                return a_min < 255
 
             def _apply_filter_mode(self_inner, filter_mode: str, alpha: float) -> tuple[bool, bool]:
                 """
@@ -1239,6 +1264,57 @@ class GLViewerFrame(tk.Frame):
                                     self_inner._apply_teamcolor(team_rgb, alpha)
                                 else:
                                     # Non-teamcolor: use normal filter mode, unless dbg alpha off
+                                    fm = (filter_mode or "None").lower()
+
+                                    # If this is a Blend layer and the texture has any transparency,
+                                    # do a depth-only prepass with alpha test to fix occlusion.
+                                    do_depth_prepass = (
+                                        (not getattr(self_inner, "_dbg_alpha_off", False))
+                                        and fm == "blend"
+                                        and tid is not None
+                                        and self_inner._tex_has_any_transparency(tid)
+                                    )
+
+                                    if do_depth_prepass:
+                                        # Depth prepass: write depth where alpha > 0, no color writes.
+                                        glDisable(GL_BLEND)
+                                        glEnable(GL_ALPHA_TEST)
+                                        glAlphaFunc(GL_GREATER, 0.01)  # treat alpha==0 as hole
+                                        glDepthMask(True)
+                                        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
+
+                                        # draw geometry once (depth only)
+                                        vlen = len(verts)
+                                        began = False
+                                        try:
+                                            glBegin(GL_TRIANGLES)
+                                            began = True
+                                            for (i0, i1, i2) in tris:
+                                                if (
+                                                    i0 < 0 or i1 < 0 or i2 < 0
+                                                    or i0 >= vlen or i1 >= vlen or i2 >= vlen
+                                                ):
+                                                    continue
+                                                for vid in (i0, i1, i2):
+                                                    v = skin_vertex(verts[vid], vid)
+                                                    if uvs is not None and vid < len(uvs):
+                                                        u, vv = uvs[vid]
+                                                        if getattr(self_inner, "_dbg_flip_v", False):
+                                                            vv = 1.0 - float(vv)
+                                                        glTexCoord2f(float(u), float(vv))
+                                                    glVertex3f(float(v[0]), float(v[1]), float(v[2]))
+                                        finally:
+                                            if began:
+                                                glEnd()
+
+                                        # restore color writes
+                                        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
+                                        glDisable(GL_ALPHA_TEST)
+
+                                        if getattr(self_inner, "_dbg_enabled", True):
+                                            self_inner._dbg(f"[blend] depth-prepass enabled material={mid} tid={tid}")
+
+                                    # Normal pass (your existing behavior)
                                     self_inner._apply_filter_mode(filter_mode, alpha)
                                     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
                                     if getattr(self_inner, "_dbg_alpha_off", False):

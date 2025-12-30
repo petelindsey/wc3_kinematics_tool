@@ -256,8 +256,7 @@ class UnitAnimEvaluator:
         world_pos: List[Vec3] = [(0.0, 0.0, 0.0)] * (max_id + 1 if max_id >= 0 else 0)
 
         t_rel_ms = int(t_abs_ms) - int(seq_start_ms)
-        if t_abs_ms == seq_start_ms:
-            print("[dbg] evaluator domain check:", "t_abs=", t_abs_ms, "t_rel=", t_rel_ms, "dur=", seq_dur_ms)
+
         t_abs_ms = int(t_abs_ms)
         seq_start_ms = int(seq_start_ms)
         seq_dur_ms = int(seq_dur_ms)

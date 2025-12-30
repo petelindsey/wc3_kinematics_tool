@@ -77,6 +77,20 @@ class ViewerWindow(tk.Toplevel):
         self.seq: Optional[SequenceDef] = None
         self.t_ms: int = 0
 
+        # ---- animation UI state ----
+        # timeline_var is sequence-relative time (ms): 0..duration
+        self.timeline_var = tk.DoubleVar(value=0.0)
+        # playback speed multiplier applied only while playing
+        self.speed_var = tk.DoubleVar(value=1.0)
+
+        # Internal guards for timeline scrubbing
+        self._scrubbing = False
+        self._was_playing_before_scrub = False
+        self._ignore_timeline_callback = False
+
+        # Optional debug prints for animation timing / quantization
+        self.debug_anim_var = tk.BooleanVar(value=False)
+
         self._evaluator: Optional[UnitAnimEvaluator] = None
         self._rig = None
 
@@ -103,7 +117,28 @@ class ViewerWindow(tk.Toplevel):
 
         controls = ttk.Frame(top)
         controls.pack(fill="x", padx=8, pady=(0, 8))
+        timeline = ttk.Frame(top)
+        timeline.pack(fill="x", padx=8, pady=(0, 8))
 
+        ttk.Label(timeline, text="Timeline").pack(side="left")
+
+        # tk.Scale gives us proper mouse events + modifier state for quantized scrubbing
+        self.timeline_scale = tk.Scale(
+            timeline,
+            from_=0,
+            to=1000,
+            orient="horizontal",
+            showvalue=False,
+            resolution=1,
+            variable=self.timeline_var,
+            length=420,
+        )
+        self.timeline_scale.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        # Bind scrub interactions (press/drag/release + track clicks)
+        self.timeline_scale.bind("<Button-1>", self._on_timeline_press, add=True)
+        self.timeline_scale.bind("<B1-Motion>", self._on_timeline_drag, add=True)
+        self.timeline_scale.bind("<ButtonRelease-1>", self._on_timeline_release, add=True)
         menubar = tk.Menu(self)
         self.config(menu=menubar)
 
@@ -144,6 +179,8 @@ class ViewerWindow(tk.Toplevel):
 
         team_menu = tk.Menu(debug_menu, tearoff=0)
         debug_menu.add_cascade(label="TeamColor", menu=team_menu)
+        debug_menu.add_separator()
+        debug_menu.add_checkbutton(label="Anim Debug Prints",variable=self.debug_anim_var,)
 
         mode_menu = tk.Menu(team_menu, tearoff=0)
         team_menu.add_cascade(label="Mode", menu=mode_menu)
@@ -210,6 +247,25 @@ class ViewerWindow(tk.Toplevel):
         # also handle typing + enter
         self.player_spin.bind("<Return>", lambda _e: self._on_player_change())
         self.player_spin.bind("<FocusOut>", lambda _e: self._on_player_change())
+               # Playback speed (applies only while playing)
+        speed_frame = ttk.Frame(controls)
+        speed_frame.pack(side="right", padx=(12, 0))
+        ttk.Label(speed_frame, text="Speed").pack(side="left")
+
+        self.speed_scale = ttk.Scale(
+            speed_frame,
+            from_=0.10,
+            to=3.00,
+            orient="horizontal",
+            length=120,
+            variable=self.speed_var,
+            command=self._on_speed_changed,
+        )
+        self.speed_scale.pack(side="left", padx=(6, 0))
+        self.speed_val_lbl = ttk.Label(speed_frame, text="1.00x", width=6)
+        self.speed_val_lbl.pack(side="left", padx=(6, 0))
+
+        self._on_speed_changed()
 
         self.time_lbl = ttk.Label(controls, text="t=0ms")
         self.time_lbl.pack(side="right")
@@ -224,6 +280,130 @@ class ViewerWindow(tk.Toplevel):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _on_speed_changed(self, _val: str | float | None = None) -> None:
+        """Update the speed label; tick loop reads speed_var every frame."""
+        try:
+            sp = float(self.speed_var.get() or 1.0)
+        except Exception:
+            sp = 1.0
+        sp = max(0.10, min(3.00, sp))
+        if abs(sp - float(self.speed_var.get() or 1.0)) > 1e-6:
+            # Clamp back into var if user typed something odd
+            self.speed_var.set(sp)
+        if hasattr(self, "speed_val_lbl"):
+            self.speed_val_lbl.config(text=f"{sp:.2f}x")
+        if self.debug_anim_var.get():
+            print(f"[anim] speed set to {sp:.3f}x")
+
+    @staticmethod
+    def _mod_quant_step_from_state(state: int) -> int:
+        """Return scrub quantization step (ms) based on modifier keys."""
+        # Tk state bitmasks are platform-dependent-ish but these are stable on Win/X11.
+        SHIFT_MASK = 0x0001
+        CTRL_MASK = 0x0004
+        if state & CTRL_MASK:
+            return 1
+        if state & SHIFT_MASK:
+            return 10
+        return 33
+
+    def _quantize_t_rel(self, raw_t_rel: float, *, state: int) -> tuple[int, int]:
+        """Quantize raw sequence-relative time to avoid jitter while scrubbing."""
+        dur = int(getattr(self, "_seq_dur_ms", 0) or 0)
+        step = self._mod_quant_step_from_state(state)
+        if dur <= 0:
+            return 0, step
+        # Snap to nearest step, then clamp
+        q = int(round(float(raw_t_rel) / float(step)) * step)
+        q = max(0, min(dur, q))
+        return q, step
+
+    def _set_time_from_t_rel(self, t_rel_ms: int) -> None:
+        """Set absolute cursor (t_ms) from a sequence-relative time and redraw."""
+        if not hasattr(self, "_seq_start_ms"):
+            return
+        seq_start = int(self._seq_start_ms)
+        dur = int(getattr(self, "_seq_dur_ms", 0) or 0)
+        t_rel_ms = max(0, min(dur, int(t_rel_ms)))
+        self.t_ms = float(seq_start + t_rel_ms)
+        self._render_current()
+
+    def _update_timeline_bounds(self) -> None:
+        """Update slider range from ImportedModel sequence timing."""
+        dur = int(getattr(self, "_seq_dur_ms", 0) or 0)
+        if hasattr(self, "timeline_scale"):
+            try:
+                self.timeline_scale.config(to=max(1, dur))
+            except Exception:
+                pass
+        # Ensure current var is clamped
+        self._ignore_timeline_callback = True
+        try:
+            cur = float(self.timeline_var.get() or 0.0)
+            self.timeline_var.set(max(0.0, min(float(dur), cur)))
+        finally:
+            self._ignore_timeline_callback = False
+
+    def _on_timeline_press(self, event: tk.Event) -> None:
+        # Clicking the track should also quantize, so wait until Scale has updated its value.
+        self._scrubbing = True
+        self._was_playing_before_scrub = bool(self.playing)
+        # Scrubbing should never *start* playback; safest is to pause while scrubbing.
+        self.playing = False
+
+        def apply_click_quant() -> None:
+            if self._ignore_timeline_callback:
+                return
+            raw = float(self.timeline_var.get() or 0.0)
+            q, step = self._quantize_t_rel(raw, state=int(getattr(event, "state", 0) or 0))
+            self._ignore_timeline_callback = True
+            try:
+                self.timeline_var.set(float(q))
+            finally:
+                self._ignore_timeline_callback = False
+            if self.debug_anim_var.get():
+                print(f"[anim] scrub press raw={raw:.2f} q={q} step={step}ms")
+            self._set_time_from_t_rel(q)
+
+        self.after_idle(apply_click_quant)
+
+    def _on_timeline_drag(self, event: tk.Event) -> None:
+        if self._ignore_timeline_callback:
+            return
+        raw = float(self.timeline_var.get() or 0.0)
+        q, step = self._quantize_t_rel(raw, state=int(getattr(event, "state", 0) or 0))
+        # No jitter: keep var exactly on quantized values
+        self._ignore_timeline_callback = True
+        try:
+            self.timeline_var.set(float(q))
+        finally:
+            self._ignore_timeline_callback = False
+        if self.debug_anim_var.get():
+            print(f"[anim] scrub drag raw={raw:.2f} q={q} step={step}ms")
+        self._set_time_from_t_rel(q)
+
+    def _on_timeline_release(self, event: tk.Event) -> None:
+        # Keep current time; do not snap back. (Playback remains paused unless user hits Play.)
+        if self._ignore_timeline_callback:
+            self._scrubbing = False
+            return
+        raw = float(self.timeline_var.get() or 0.0)
+        q, step = self._quantize_t_rel(raw, state=int(getattr(event, "state", 0) or 0))
+        self._ignore_timeline_callback = True
+        try:
+            self.timeline_var.set(float(q))
+        finally:
+            self._ignore_timeline_callback = False
+        self._set_time_from_t_rel(q)
+
+        # Resume playback if we were playing prior to scrubbing
+        self.playing = bool(self._was_playing_before_scrub)
+
+        if self.debug_anim_var.get():
+            print(
+                f"[anim] scrub release raw={raw:.2f} q={q} step={step}ms "
+                f"resume={self.playing}"
+            )
 
     def _open_geosets_popup(self) -> None:
         # Lazily build a popup with checkboxes for each geoset in the current mesh.
@@ -422,7 +602,10 @@ class ViewerWindow(tk.Toplevel):
             print('Start and/or Stop Not Defined, cannot animate')
             return
 
-        self.t_ms += self.TICK_MS
+        speed = float(self.speed_var.get() or 1.0)
+        self.t_ms += self.TICK_MS * speed
+        if self.debug_anim_var.get():
+            print(f"[anim] tick speed={speed:.3f} t_abs={int(self.t_ms)}")
 
         seq_start = int(self._seq_start_ms)
         seq_end = int(self._seq_end_ms)
@@ -533,6 +716,7 @@ class ViewerWindow(tk.Toplevel):
         self._seq_end_ms = int(seq.end_abs)
         self._seq_dur_ms = int(seq.dur)
         self.t_ms = int(seq.start_abs)
+        self._update_timeline_bounds()
 
         print(
             f"[viewer] seq={seq.name!r} start={self._seq_start_ms} end={self._seq_end_ms} dur={self._seq_dur_ms}"
@@ -714,4 +898,22 @@ class ViewerWindow(tk.Toplevel):
         # Single pose submit (don’t call twice)
         self.gl.set_pose(pose, self._rig, active_ids=None)
 
-        self.time_lbl.config(text=f"t={t_abs}ms")
+        t_rel = int(t_abs - seq_start)
+        pct = 0.0 if seq_dur <= 0 else (max(0.0, min(1.0, t_rel / float(seq_dur))) * 100.0)
+        # Prefer the actual active sequence name if available; otherwise use sequence_name
+        active_seq_name = getattr(getattr(self, "_evaluator", None), "sequence_name", None)
+        if not active_seq_name:
+            active_seq_name = getattr(self, "sequence_name", "(seq)")
+
+        self.time_lbl.config(text=f"{active_seq_name}  {t_rel}ms  ({pct:.1f}%)")
+
+        # Keep timeline slider in sync during playback (but never fight the user's drag)
+        if not self._scrubbing:
+            self._ignore_timeline_callback = True
+            try:
+                self.timeline_var.set(float(t_rel))
+            finally:
+                self._ignore_timeline_callback = False
+
+        if self.debug_anim_var.get():
+            print(f"[anim] seq={active_seq_name!r} dur={seq_dur} t_rel={t_rel} t_abs={t_abs}")
