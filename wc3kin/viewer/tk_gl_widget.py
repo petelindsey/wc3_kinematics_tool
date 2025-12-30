@@ -51,6 +51,13 @@ try:
         GL_ZERO,
         GL_TEXTURE_ENV_COLOR,
         GL_SRC_COLOR,
+        glGetBooleanv,
+        glDepthFunc,
+        glIsEnabled,
+        GL_ALPHA_TEST,
+        GL_DEPTH_WRITEMASK,
+        GL_LEQUAL,
+        glBlendFuncSeparate,
         glAlphaFunc,
         glBegin,
         glBindTexture,
@@ -402,7 +409,7 @@ class GLViewerFrame(tk.Frame):
                 self_inner._dbg_color_by_tri = False
 
                 # IMPORTANT: when True, force opaque pipeline (no alpha test, no blending)
-                self_inner._dbg_alpha_off = True
+                self_inner._dbg_alpha_off = False
 
                 # UV debugging (very common: V is upside-down)
                 self_inner._dbg_flip_v = False
@@ -610,7 +617,9 @@ class GLViewerFrame(tk.Frame):
                         GL_UNSIGNED_BYTE,
                         data,
                     )
-
+                    a_min, a_max = img.getchannel("A").getextrema()
+                    if "TeamColor" in png_name or "TeamGlow" in png_name:
+                        self_inner._dbg(f"[tex] {png_name} alpha extrema: min={a_min} max={a_max}")
                     cache[png_path] = tex_id
                     print(f"[viewer] loaded texture {png_name} ({w}x{h})")
                     return tex_id
@@ -625,6 +634,7 @@ class GLViewerFrame(tk.Frame):
                 Returns (blending_enabled, writes_depth).
                 If _dbg_alpha_off is True, this function will NEVER enable alpha test or blending.
                 """
+                #self_inner._dbg(f"[filter] fm={fm} ALPHA_TEST={bool(glIsEnabled(GL_ALPHA_TEST))} BLEND={bool(glIsEnabled(GL_BLEND))} DEPTHMASK={bool(glGetBooleanv(GL_DEPTH_WRITEMASK))}")
                 if getattr(self_inner, "_dbg_alpha_off", False):
                     glDisable(GL_ALPHA_TEST)
                     glDisable(GL_BLEND)
@@ -634,19 +644,26 @@ class GLViewerFrame(tk.Frame):
                 fm = (filter_mode or "None").lower()
 
                 if fm in ("none",):
+                    glDisable(GL_ALPHA_TEST)
+                    glDisable(GL_BLEND)
+                    glDepthMask(True)
+                    return (False, True)
+
+                if fm in ("transparent",):
                     glDisable(GL_BLEND)
                     glEnable(GL_ALPHA_TEST)
+                    # WC3 cutout behaves like "alpha > 0"
                     glAlphaFunc(GL_GREATER, 0.01)
                     glDepthMask(True)
                     return (False, True)
 
                 glDisable(GL_ALPHA_TEST)
 
-                if fm in ("transparent", "blend"):
-                    glEnable(GL_BLEND)
-                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-                    glDepthMask(False)
-                    return (True, False)
+                if fm in ("blend",):
+                     glEnable(GL_BLEND)
+                     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                     glDepthMask(False)
+                     return (True, False)
 
                 if fm in ("additive", "addalpha"):
                     glEnable(GL_BLEND)
@@ -660,10 +677,9 @@ class GLViewerFrame(tk.Frame):
                     glDepthMask(False)
                     return (True, False)
 
-                glEnable(GL_BLEND)
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-                glDepthMask(False)
-                return (True, False)
+                glDisable(GL_BLEND)
+                glDepthMask(True)
+                return (False, True)
 
             def set_geosets_enabled(self_inner, enabled: Optional[list[bool]]) -> None:
                 self_inner._enabled_geosets = enabled
@@ -693,6 +709,7 @@ class GLViewerFrame(tk.Frame):
                 glEnable(GL_LINE_SMOOTH)
                 glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
                 glDisable(GL_DEPTH_TEST)
+                glDepthFunc(GL_LEQUAL)
 
             def request_redraw(self_inner) -> None:
                 if hasattr(self_inner, "_display"):
@@ -861,7 +878,7 @@ class GLViewerFrame(tk.Frame):
                 Assumes a teamcolor texture is bound.
                 """
                 mode = str(getattr(self_inner, "_dbg_teamcolor_mode", "wc3_mask") or "wc3_mask").lower()
-
+                
                 glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE)
 
                 # Common: constant color = team RGB, constant alpha = layer alpha
@@ -924,24 +941,30 @@ class GLViewerFrame(tk.Frame):
                 """
                 Apply blending for teamcolor layers based on debug override.
                 """
-                if getattr(self_inner, "_dbg_alpha_off", False):
+                mode = str(getattr(self_inner, "_dbg_teamcolor_blend", "layer") or "layer").lower()
+                
+                def _alpha_blend() -> None:
+                    """WC3 teamcolor mask blend: mix using source alpha; avoid writing depth."""
                     glDisable(GL_ALPHA_TEST)
-                    glDisable(GL_BLEND)
-                    glDepthMask(True)
+                    glEnable(GL_BLEND)
+                    # Prefer separate alpha blend if available so framebuffer alpha doesn't get clobbered.
+                    try:
+                        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+                    except Exception:
+                        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                    
+                    glDepthMask(False)
+                    
+
+                if mode== "alpha":
+                    _alpha_blend()
                     return
 
-                mode = str(getattr(self_inner, "_dbg_teamcolor_blend", "layer") or "layer").lower()
+                
                 if mode == "none":
                     glDisable(GL_ALPHA_TEST)
                     glDisable(GL_BLEND)
                     glDepthMask(True)
-                    return
-
-                if mode == "alpha":
-                    glDisable(GL_ALPHA_TEST)
-                    glEnable(GL_BLEND)
-                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-                    glDepthMask(False)
                     return
 
                 if mode == "add":
@@ -952,7 +975,14 @@ class GLViewerFrame(tk.Frame):
                     return
 
                 # default: layer-driven
-                self_inner._apply_filter_mode(filter_mode, alpha)
+                # WC3 quirk: TeamColor layers often declare FilterMode None, but they still behave as a mask blend.
+                # If we follow "None" literally (alpha-test only), the pass becomes an opaque flat team color.
+                fm = (filter_mode or "None").lower()
+                if fm in ("none",) and str(getattr(self_inner, "_dbg_teamcolor_mode", "wc3_mask") or "wc3_mask").lower() == "wc3_mask":
+                    _alpha_blend()
+                else:
+                    self_inner._apply_filter_mode(filter_mode, alpha)
+
 
             def redraw(self_inner) -> None:
                 w = int(self_inner.winfo_width())
@@ -979,7 +1009,8 @@ class GLViewerFrame(tk.Frame):
                 glLoadIdentity()
 
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-
+                glEnable(GL_DEPTH_TEST)
+                glDepthFunc(GL_LEQUAL)
                 pose = getattr(self_inner, "_pose", None)
                 rig = getattr(self_inner, "_rig", None)
                 mesh = getattr(self_inner, "_mesh", None)
@@ -1145,7 +1176,36 @@ class GLViewerFrame(tk.Frame):
                         else:
                             glEnable(GL_DEPTH_TEST)
 
-                            for layer in layers:
+                            # WC3 TeamColor behaves like a mask overlay: draw base layers first, TeamColor last.
+                            def _is_team_layer(layer_dict: dict) -> bool:
+                                try:
+                                    layer_tex_id = layer_dict.get("texture_id", None)
+                                    if textures is None or layer_tex_id is None:
+                                        return False
+                                    ti = int(layer_tex_id)
+                                    if ti < 0 or ti >= len(textures):
+                                        return False
+                                    te = textures[ti]
+                                    rid = te.get("replaceable_id", None)
+                                    return rid is not None and int(rid) == 1
+                                except Exception:
+                                    return False
+
+                            mode = str(getattr(self_inner, "_dbg_teamcolor_mode", "wc3_mask") or "wc3_mask").lower()
+
+                            if mode == "wc3_mask":
+                                # Underlay: TeamColor first, then everything else
+                                ordered_layers = [ly for ly in layers if _is_team_layer(ly)] + [ly for ly in layers if not _is_team_layer(ly)]
+                            else:
+                                # Other modes: allow overlay experiments
+                                ordered_layers = [ly for ly in layers if not _is_team_layer(ly)] + [ly for ly in layers if _is_team_layer(ly)]
+                            
+                            if getattr(self_inner, "_dbg_enabled", True):
+                                for i, ly in enumerate(ordered_layers):
+                                    if _is_team_layer(ly):
+                                        self_inner._dbg(f"[teamcolor] material={mid} ordered_index={i}/{len(ordered_layers)-1} filter={ly.get('filter_mode')} alpha={ly.get('alpha')}")
+
+                            for layer in ordered_layers:
                                 layer_tex_id = layer.get("texture_id", None)
                                 filter_mode = layer.get("filter_mode", "None")
                                 alpha = float(layer.get("alpha", 1.0) or 1.0)
@@ -1169,6 +1229,7 @@ class GLViewerFrame(tk.Frame):
                                     rid = tex_entry.get("replaceable_id", None)
                                     if rid is not None and int(rid) == 1:
                                         is_teamcolor = True
+                                        self_inner._dbg(f"[teamcolor] BLEND={bool(glIsEnabled(GL_BLEND))} DEPTHMASK={bool(glGetBooleanv(GL_DEPTH_WRITEMASK))} depthfunc=LEQUAL_expected")
                                         player = int(getattr(self_inner, "_player_index", 0))
                                         team_rgb = self_inner._get_team_color_rgb(player)
 

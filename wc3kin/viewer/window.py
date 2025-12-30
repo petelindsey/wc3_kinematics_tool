@@ -54,7 +54,7 @@ class ViewerWindow(tk.Toplevel):
         self.unit_id = int(unit_id)
         self.sequence_name = str(sequence_name)
         # ---- Debug UI vars ----
-        self.dbg_alpha_off_var = tk.BooleanVar(value=True)
+        self.dbg_alpha_off_var = tk.BooleanVar(value=False)
         self.dbg_disable_textures_var = tk.BooleanVar(value=False)
         self.dbg_color_by_tri_var = tk.BooleanVar(value=False)
         self.dbg_prints_var = tk.BooleanVar(value=True)
