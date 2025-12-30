@@ -7,9 +7,10 @@ from pathlib import Path
 from tkinter import ttk
 import sqlite3
 import json
+import os
 
 
-from .viewer.window import ViewerWindow
+from .viewer.window import ViewerPanel
 from .config import load_config
 from .db import (
     connect,
@@ -43,8 +44,8 @@ def _setup_logger(log_path: Path) -> logging.Logger:
 
 
 class App(tk.Tk):
-    BASE_GEOM = "980x620"
-    SQL_GEOM = "980x820"
+    BASE_GEOM = "980x720"
+    SQL_GEOM = "980x920"
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
@@ -64,6 +65,19 @@ class App(tk.Tk):
         self.show_death_var = tk.BooleanVar(value=False)
         self.json_only_var = tk.BooleanVar(value=True)
         self.force_update_var = tk.BooleanVar(value=False) 
+
+        #--------------------------------------------
+        #-- Persistance info
+        #--------------------------------------------
+        self._state_path = Path(config_path).with_name("app_state.json")
+        self._restore_state = self._load_app_state()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        geom = self._restore_state.get("geometry")
+        if geom:
+            try:
+                self.geometry(geom)
+            except Exception:
+                pass
 
         # menu
         menubar = tk.Menu(self)
@@ -112,9 +126,13 @@ class App(tk.Tk):
 
 
         self.unit_id_by_name: dict[str, int] = {}
+        self._viewer_uid: int | None = None
+        self._viewer_seq: str | None = None
 
         self._build_ui()
         self._refresh_races()
+        self.after(1, self._apply_restored_state)
+
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self)
@@ -137,6 +155,7 @@ class App(tk.Tk):
         ttk.Label(row, text="Sequence").pack(side="left")
         self.anim_cb = ttk.Combobox(row, textvariable=self.anim_var, state="readonly", width=28)
         self.anim_cb.pack(side="left", padx=(6, 8))
+        self.anim_cb.bind("<<ComboboxSelected>>", lambda _e: self._open_viewer())
 
         self.show_death_cb = ttk.Checkbutton(
             row,
@@ -184,9 +203,12 @@ class App(tk.Tk):
         info_frame = ttk.LabelFrame(self, text="Output / Errors (copy-paste friendly)")
         info_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.info_text = tk.Text(info_frame, wrap="word")
-        self.info_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.info_text = tk.Text(info_frame, wrap="word", height = 24)
+        info_frame.pack(fill="x", expand=False, padx=10, pady=10)
+        self.viewer_frame = ttk.LabelFrame(self, text="Viewer (embedded)")
+        self.viewer_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
+        self.viewer_panel = None  # will hold ViewerPanel instance
         # SQL console (hidden by default)
         self.sql_frame = ttk.LabelFrame(self, text="SQL Console (use carefully)")
         self.sql_visible = False
@@ -206,6 +228,7 @@ class App(tk.Tk):
         self.sql_output.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self.sql_last_headers: list[str] = []
         self.sql_last_rows: list[dict[str, object]] = []
+
 
     def _open_viewer(self) -> None:
         unit_name = self.unit_var.get().strip()
@@ -232,17 +255,57 @@ class App(tk.Tk):
         except Exception as e:
             self._write_info(f"Viewer: blob ingest warning (continuing): {e!r}", append=True)
 
+        # ---- reuse viewer if already created ----
+        if self.viewer_panel is None:
+            try:
+                self.viewer_panel = ViewerPanel(
+                    self.viewer_frame,
+                    con=self.con,
+                    units_root=self.cfg.units_root,
+                    unit_id=uid,
+                    sequence_name=seq_name,
+                    on_close=None,          # embedded: App owns lifecycle
+                    build_menus_on=None,    # embedded: keep App’s menubar
+                )
+                self.viewer_panel.pack(fill="both", expand=True)
+                self._viewer_uid = uid
+                self._viewer_seq = seq_name
+            except Exception as e:
+                self.logger.exception("Viewer open failed")
+                self._write_info(f"Viewer failed:\n{e!r}\n{traceback.format_exc()}", append=True)
+                self.viewer_panel = None
+            return
+
+        # viewer exists: no-op if same selection
+        if self._viewer_uid == uid and self._viewer_seq == seq_name:
+            return
+
+        # reload in-place (no widget destruction)
         try:
-            ViewerWindow(
-                self,
-                con=self.con,
-                units_root=self.cfg.units_root,
-                unit_id=uid,
-                sequence_name=seq_name,
-            )
+            if hasattr(self.viewer_panel, "load_unit_sequence"):
+                self.viewer_panel.load_unit_sequence(uid, seq_name)
+            else:
+                # fallback (older ViewerPanel): rebuild if method missing
+                if hasattr(self.viewer_panel, "close"):
+                    self.viewer_panel.close()
+                self.viewer_panel.destroy()
+                self.viewer_panel = ViewerPanel(
+                    self.viewer_frame,
+                    con=self.con,
+                    units_root=self.cfg.units_root,
+                    unit_id=uid,
+                    sequence_name=seq_name,
+                    on_close=None,
+                    build_menus_on=None,
+                )
+                self.viewer_panel.pack(fill="both", expand=True)
+
+            self._viewer_uid = uid
+            self._viewer_seq = seq_name
         except Exception as e:
-            self.logger.exception("Viewer open failed")
-            self._write_info(f"Viewer failed:\n{e!r}\n{traceback.format_exc()}", append=True)
+            self.logger.exception("Viewer reload failed")
+            self._write_info(f"Viewer reload failed:\n{e!r}\n{traceback.format_exc()}", append=True)
+
 
     def _copy_sql_output_json(self) -> None:
         import json
@@ -328,6 +391,7 @@ class App(tk.Tk):
             self._on_unit_changed()
         else:
             self._write_info(f"No units stored for race: {race}")
+        self._open_viewer()
 
     def _on_unit_changed(self) -> None:
         unit_name = self.unit_var.get().strip()
@@ -359,6 +423,7 @@ class App(tk.Tk):
             f"  Last Scanned: {detail.last_scanned}\n\n"
             f"Sequences in DB: {len(seqs)}\n"
         )
+        self._open_viewer()
 
     def _import_rescan(self) -> None:
         try:
@@ -775,6 +840,95 @@ class App(tk.Tk):
             self.sql_output.insert("end", f"SQLite error: {e!r}\n")
         except Exception as e:
             self.sql_output.insert("end", f"Error: {e!r}\n")
+
+    def _load_app_state(self) -> dict:
+        try:
+            if self._state_path.exists():
+                return json.loads(self._state_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_app_state(self) -> None:
+        state = {
+            "geometry": self.geometry(),
+            "race": self.race_var.get(),
+            "unit": self.unit_var.get(),
+            "anim": self.anim_var.get(),
+            "show_death": bool(self.show_death_var.get()),
+            "json_only": bool(self.json_only_var.get()),
+            "force_update": bool(self.force_update_var.get()),
+        }
+        try:
+            self._state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except Exception as e:
+            # Don’t crash on save; just log
+            try:
+                self.logger.warning("Failed to save app_state.json: %r", e)
+            except Exception:
+                pass
+
+    def _apply_restored_state(self) -> None:
+        st = getattr(self, "_restore_state", None) or {}
+
+        # restore toggles first (they influence available sequences)
+        try:
+            if "show_death" in st:
+                self.show_death_var.set(bool(st["show_death"]))
+            if "json_only" in st:
+                self.json_only_var.set(bool(st["json_only"]))
+            if "force_update" in st:
+                self.force_update_var.set(bool(st["force_update"]))
+        except Exception:
+            pass
+
+        # Restore race/unit/anim in order, using your existing population logic
+        race = (st.get("race") or "").strip()
+        unit = (st.get("unit") or "").strip()
+        anim = (st.get("anim") or "").strip()
+
+        # Race
+        races = list(self.race_cb["values"]) if self.race_cb is not None else []
+        if race and race in races:
+            self.race_var.set(race)
+            self._on_race_changed()
+        else:
+            # ensure lists are at least populated
+            self._on_race_changed()
+
+        # Unit
+        units = list(self.unit_cb["values"]) if self.unit_cb is not None else []
+        if unit and unit in units:
+            self.unit_var.set(unit)
+            self._on_unit_changed()
+        else:
+            # _on_race_changed already selected first unit; ensure unit change ran
+            self._on_unit_changed()
+
+        # Anim
+        anims = list(self.anim_cb["values"]) if self.anim_cb is not None else []
+        if anim and anim in anims:
+            self.anim_var.set(anim)
+
+        # Finally: ensure embedded viewer matches current selection
+        try:
+            self._open_viewer()
+        except Exception:
+            pass
+
+    def _on_close(self) -> None:
+        # Save state first
+        self._save_app_state()
+
+        # Cleanly close embedded viewer if present
+        try:
+            if self.viewer_panel is not None:
+                if hasattr(self.viewer_panel, "close"):
+                    self.viewer_panel.close()
+        except Exception:
+            pass
+
+        self.destroy()
 
 def run_app() -> None:
     here = Path(__file__).resolve().parent.parent

@@ -1390,6 +1390,31 @@ class GLViewerFrame(tk.Frame):
 
                 glFlush()
 
+
+
+            def capture_image(self_inner) -> Image.Image:
+                """Read the current framebuffer into a PIL RGBA image."""
+                w = int(self_inner.winfo_width())
+                h = int(self_inner.winfo_height())
+                if w <= 1 or h <= 1:
+                    raise RuntimeError("OpenGL widget has invalid size for capture")
+
+                # Ensure a recent draw
+                try:
+                    self_inner.redraw()
+                except Exception:
+                    pass
+
+                try:
+                    from OpenGL.GL import glReadPixels, GL_RGBA, GL_UNSIGNED_BYTE
+                except Exception as e:
+                    raise RuntimeError("PyOpenGL is required for framebuffer capture") from e
+
+                data = glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE)
+                img = Image.frombytes("RGBA", (w, h), data)
+                return img.transpose(Image.FLIP_TOP_BOTTOM)
+
+
         self._impl = _Impl(self, width=640, height=480)
         self._impl.pack(fill="both", expand=True)
 
@@ -1580,3 +1605,18 @@ class GLViewerFrame(tk.Frame):
         if self._impl is None:
             return "layer"
         return str(getattr(self._impl, "_dbg_teamcolor_blend", "layer"))
+
+    # ---- export helpers ----
+    def capture_image(self) -> Optional[Image.Image]:
+        """Capture the current OpenGL framebuffer into a PIL image.
+
+        Returns None if the OpenGL widget isn't available.
+        """
+        if self._impl is None:
+            return None
+        try:
+            return self._impl.capture_image()
+        except Exception:
+            traceback.print_exc()
+            return None
+

@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
-from typing import Optional
+from PIL import Image
+from tkinter import ttk, filedialog, messagebox
+from typing import Optional, Callable
 
 import sqlite3
+import os
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 from .evaluator import UnitAnimEvaluator, build_anims_from_boneanims_json
@@ -26,12 +31,17 @@ from wc3kin.viewer.evaluator import build_rig_from_imported_model, build_anims_f
 from wc3kin.wc3mdl import query as mdlq
 from .evaluator import Pose, mat4_identity, transform_point
 
-class ViewerWindow(tk.Toplevel):
+
+class ViewerPanel(ttk.Frame):
     """
-    Minimal viewer:
-      - skeleton render
+    Embedded viewer panel:
+      - OpenGL widget inside a Frame (no separate window)
       - play/pause/rewind
       - loop toggle
+      - timeline scrub (quantized w/ shift/ctrl)
+      - playback speed multiplier
+
+    If you still want a toplevel window version, use ViewerWindow (wrapper).
     """
 
     TICK_MS = 16  # ~60fps stepping; deterministic step size
@@ -44,15 +54,18 @@ class ViewerWindow(tk.Toplevel):
         units_root: Path,
         unit_id: int,
         sequence_name: str,
+        on_close: Optional[Callable[[], None]] = None,
+        build_menus_on: Optional[tk.Misc] = None,
     ) -> None:
         super().__init__(master)
-        self.title("WC3 Viewer")
-        self.geometry("980x680")
+
+        self._on_close_cb = on_close
 
         self.con = con
         self.units_root = units_root
         self.unit_id = int(unit_id)
         self.sequence_name = str(sequence_name)
+
         # ---- Debug UI vars ----
         self.dbg_alpha_off_var = tk.BooleanVar(value=False)
         self.dbg_disable_textures_var = tk.BooleanVar(value=False)
@@ -62,10 +75,10 @@ class ViewerWindow(tk.Toplevel):
         self.teamcolor_mode_var = tk.StringVar(value="wc3_mask")
         self.teamcolor_blend_var = tk.StringVar(value="layer")
 
-        #view bones off by default
+        # view bones off by default
         self.bones_var = tk.BooleanVar(value=False)
 
-        #number of player for team color
+        # number of player for team color
         self.player_var = tk.IntVar(value=0)
         self._geoset_vars = []  # list[tk.BooleanVar]
         self._geosets_popup = None
@@ -98,7 +111,7 @@ class ViewerWindow(tk.Toplevel):
         self._persist = ViewerPersist.load(default_persistence_path(self.con))
         self._cam_init_done = False
 
-        # layout
+        # layout (this Frame is the root)
         top = ttk.Frame(self)
         top.pack(fill="both", expand=True)
 
@@ -139,8 +152,126 @@ class ViewerWindow(tk.Toplevel):
         self.timeline_scale.bind("<Button-1>", self._on_timeline_press, add=True)
         self.timeline_scale.bind("<B1-Motion>", self._on_timeline_drag, add=True)
         self.timeline_scale.bind("<ButtonRelease-1>", self._on_timeline_release, add=True)
-        menubar = tk.Menu(self)
-        self.config(menu=menubar)
+
+        # Controls
+        self.play_btn = ttk.Button(controls, text="Play", command=self._on_play)
+        self.pause_btn = ttk.Button(controls, text="Pause", command=self._on_pause)
+        self.rewind_btn = ttk.Button(controls, text="Rewind", command=self._on_rewind)
+        self.export_btn = ttk.Button(controls, text="Export…", command=self._on_export)
+
+        self.play_btn.pack(side="left")
+        self.pause_btn.pack(side="left", padx=(6, 0))
+        self.rewind_btn.pack(side="left", padx=(6, 0))
+        self.export_btn.pack(side="left", padx=(6, 0))
+
+        ttk.Checkbutton(controls, text="Loop", variable=self.loop_var).pack(side="left", padx=(12, 0))
+
+        ttk.Checkbutton(
+            controls,
+            text="Bones",
+            variable=self.bones_var,
+            command=self._on_toggle_bones,
+        ).pack(side="left", padx=(12, 0))
+
+        ttk.Button(controls, text="Geosets", command=self._open_geosets_popup).pack(side="left", padx=(12, 0))
+
+        ttk.Label(controls, text="Player").pack(side="left", padx=(12, 0))
+
+        self.player_spin = ttk.Spinbox(
+            controls,
+            from_=0,
+            to=11,
+            width=3,
+            textvariable=self.player_var,
+            command=self._on_player_change,
+        )
+        self.player_spin.pack(side="left", padx=(4, 0))
+
+        # also handle typing + enter
+        self.player_spin.bind("<Return>", lambda _e: self._on_player_change())
+        self.player_spin.bind("<FocusOut>", lambda _e: self._on_player_change())
+
+        # Playback speed (applies only while playing)
+        speed_frame = ttk.Frame(controls)
+        speed_frame.pack(side="right", padx=(12, 0))
+        ttk.Label(speed_frame, text="Speed").pack(side="left")
+
+        self.speed_scale = ttk.Scale(
+            speed_frame,
+            from_=0.10,
+            to=3.00,
+            orient="horizontal",
+            length=120,
+            variable=self.speed_var,
+            command=self._on_speed_changed,
+        )
+        self.speed_scale.pack(side="left", padx=(6, 0))
+        self.speed_val_lbl = ttk.Label(speed_frame, text="1.00x", width=6)
+        self.speed_val_lbl.pack(side="left", padx=(6, 0))
+
+        self._on_speed_changed()
+
+        self.time_lbl = ttk.Label(controls, text="t=0ms")
+        self.time_lbl.pack(side="right")
+
+        # Optional menubar: only do this if caller provides a window-like target
+        if build_menus_on is not None:
+            self._build_menus(build_menus_on)
+
+        # load and render first frame immediately
+        self._load_from_db()
+        self._render_current()
+    ##----------------------------------------
+    ##-- Helper Functions
+    ##----------------------------------------
+    def load_unit_sequence(self, unit_id: int, sequence_name: str) -> None:
+        """
+        Reuse the existing GL widget and reload model/sequence.
+        Safe for embedding: does not destroy/recreate the OpenGLFrame.
+        """
+        # stop playback during reload
+        self.playing = False
+        self._scrubbing = False
+        self._was_playing_before_scrub = False
+
+        unit_id = int(unit_id)
+        sequence_name = str(sequence_name)
+
+        # no-op if nothing changed
+        if getattr(self, "unit_id", None) == unit_id and getattr(self, "sequence_name", None) == sequence_name:
+            return
+
+        # update selection
+        self.unit_id = unit_id
+        self.sequence_name = sequence_name
+
+        # reset camera-init so fit/restore runs for new model/seq
+        self._cam_init_done = False
+
+        # close any old geoset popup (it references old mesh count)
+        try:
+            if self._geosets_popup is not None and self._geosets_popup.winfo_exists():
+                self._geosets_popup.destroy()
+        except Exception:
+            pass
+        self._geosets_popup = None
+        self._geoset_vars = []
+
+        # reload + render first frame
+        self._load_from_db()
+        self._render_current()
+
+
+    # -----------------------------
+    # Menu / keybind helpers
+    # -----------------------------
+    def _build_menus(self, target: tk.Misc) -> None:
+        # Menus only work properly on a toplevel/root
+        menubar = tk.Menu(target)
+        try:
+            target.config(menu=menubar)
+        except Exception:
+            return
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
@@ -148,7 +279,6 @@ class ViewerWindow(tk.Toplevel):
         debug_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Debug", menu=debug_menu)
 
-        # Debug toggles
         debug_menu.add_checkbutton(
             label="Alpha Off (Force Opaque)",
             variable=self.dbg_alpha_off_var,
@@ -180,11 +310,10 @@ class ViewerWindow(tk.Toplevel):
         team_menu = tk.Menu(debug_menu, tearoff=0)
         debug_menu.add_cascade(label="TeamColor", menu=team_menu)
         debug_menu.add_separator()
-        debug_menu.add_checkbutton(label="Anim Debug Prints",variable=self.debug_anim_var,)
+        debug_menu.add_checkbutton(label="Anim Debug Prints", variable=self.debug_anim_var)
 
         mode_menu = tk.Menu(team_menu, tearoff=0)
         team_menu.add_cascade(label="Mode", menu=mode_menu)
-
         for label, val in [
             ("WC3 Mask (RGB=team, A=texA*alpha)", "wc3_mask"),
             ("Modulate (RGB=tex*team)", "modulate"),
@@ -200,7 +329,6 @@ class ViewerWindow(tk.Toplevel):
 
         blend_menu = tk.Menu(team_menu, tearoff=0)
         team_menu.add_cascade(label="Blend", menu=blend_menu)
-
         for label, val in [
             ("Layer (material filter mode)", "layer"),
             ("Force Alpha (SRC_A, 1-SRC_A)", "alpha"),
@@ -213,73 +341,17 @@ class ViewerWindow(tk.Toplevel):
                 value=val,
                 command=self._on_debug_flags_changed,
             )
-        self.play_btn = ttk.Button(controls, text="Play", command=self._on_play)
-        self.pause_btn = ttk.Button(controls, text="Pause", command=self._on_pause)
-        self.rewind_btn = ttk.Button(controls, text="Rewind", command=self._on_rewind)
 
-        self.play_btn.pack(side="left")
-        self.pause_btn.pack(side="left", padx=(6, 0))
-        self.rewind_btn.pack(side="left", padx=(6, 0))
+        # Ctrl+R camera reset (bind to target window; avoid bind_all)
+        try:
+            target.bind("<Control-r>", lambda _e: self._reset_camera())
+            target.bind("<Control-R>", lambda _e: self._reset_camera())
+        except Exception:
+            pass
 
-        ttk.Checkbutton(controls, text="Loop", variable=self.loop_var).pack(side="left", padx=(12, 0))
-
-        ttk.Checkbutton(
-            controls,
-            text="Bones",
-            variable=self.bones_var,
-            command=self._on_toggle_bones,
-        ).pack(side="left", padx=(12, 0))
-
-        ttk.Button(controls, text="Geosets", command=self._open_geosets_popup).pack(side="left", padx=(12, 0))
-
-        ttk.Label(controls, text="Player").pack(side="left", padx=(12, 0))
-
-        self.player_spin = ttk.Spinbox(
-            controls,
-            from_=0,
-            to=11,
-            width=3,
-            textvariable=self.player_var,
-            command=self._on_player_change,
-        )
-        self.player_spin.pack(side="left", padx=(4, 0))
-
-        # also handle typing + enter
-        self.player_spin.bind("<Return>", lambda _e: self._on_player_change())
-        self.player_spin.bind("<FocusOut>", lambda _e: self._on_player_change())
-               # Playback speed (applies only while playing)
-        speed_frame = ttk.Frame(controls)
-        speed_frame.pack(side="right", padx=(12, 0))
-        ttk.Label(speed_frame, text="Speed").pack(side="left")
-
-        self.speed_scale = ttk.Scale(
-            speed_frame,
-            from_=0.10,
-            to=3.00,
-            orient="horizontal",
-            length=120,
-            variable=self.speed_var,
-            command=self._on_speed_changed,
-        )
-        self.speed_scale.pack(side="left", padx=(6, 0))
-        self.speed_val_lbl = ttk.Label(speed_frame, text="1.00x", width=6)
-        self.speed_val_lbl.pack(side="left", padx=(6, 0))
-
-        self._on_speed_changed()
-
-        self.time_lbl = ttk.Label(controls, text="t=0ms")
-        self.time_lbl.pack(side="right")
-
-        # Ctrl+R camera reset (bind to this window; avoid bind_all)
-        self.bind("<Control-r>", lambda _e: self._reset_camera())
-        self.bind("<Control-R>", lambda _e: self._reset_camera())
-
-        # load and render first frame immediately
-        self._load_from_db()
-        self._render_current()
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
+    # -----------------------------
+    # Speed control
+    # -----------------------------
     def _on_speed_changed(self, _val: str | float | None = None) -> None:
         """Update the speed label; tick loop reads speed_var every frame."""
         try:
@@ -288,17 +360,18 @@ class ViewerWindow(tk.Toplevel):
             sp = 1.0
         sp = max(0.10, min(3.00, sp))
         if abs(sp - float(self.speed_var.get() or 1.0)) > 1e-6:
-            # Clamp back into var if user typed something odd
             self.speed_var.set(sp)
         if hasattr(self, "speed_val_lbl"):
             self.speed_val_lbl.config(text=f"{sp:.2f}x")
         if self.debug_anim_var.get():
             print(f"[anim] speed set to {sp:.3f}x")
 
+    # -----------------------------
+    # Timeline quantization / scrubbing
+    # -----------------------------
     @staticmethod
     def _mod_quant_step_from_state(state: int) -> int:
         """Return scrub quantization step (ms) based on modifier keys."""
-        # Tk state bitmasks are platform-dependent-ish but these are stable on Win/X11.
         SHIFT_MASK = 0x0001
         CTRL_MASK = 0x0004
         if state & CTRL_MASK:
@@ -313,7 +386,6 @@ class ViewerWindow(tk.Toplevel):
         step = self._mod_quant_step_from_state(state)
         if dur <= 0:
             return 0, step
-        # Snap to nearest step, then clamp
         q = int(round(float(raw_t_rel) / float(step)) * step)
         q = max(0, min(dur, q))
         return q, step
@@ -336,7 +408,6 @@ class ViewerWindow(tk.Toplevel):
                 self.timeline_scale.config(to=max(1, dur))
             except Exception:
                 pass
-        # Ensure current var is clamped
         self._ignore_timeline_callback = True
         try:
             cur = float(self.timeline_var.get() or 0.0)
@@ -345,10 +416,8 @@ class ViewerWindow(tk.Toplevel):
             self._ignore_timeline_callback = False
 
     def _on_timeline_press(self, event: tk.Event) -> None:
-        # Clicking the track should also quantize, so wait until Scale has updated its value.
         self._scrubbing = True
         self._was_playing_before_scrub = bool(self.playing)
-        # Scrubbing should never *start* playback; safest is to pause while scrubbing.
         self.playing = False
 
         def apply_click_quant() -> None:
@@ -372,7 +441,6 @@ class ViewerWindow(tk.Toplevel):
             return
         raw = float(self.timeline_var.get() or 0.0)
         q, step = self._quantize_t_rel(raw, state=int(getattr(event, "state", 0) or 0))
-        # No jitter: keep var exactly on quantized values
         self._ignore_timeline_callback = True
         try:
             self.timeline_var.set(float(q))
@@ -383,7 +451,6 @@ class ViewerWindow(tk.Toplevel):
         self._set_time_from_t_rel(q)
 
     def _on_timeline_release(self, event: tk.Event) -> None:
-        # Keep current time; do not snap back. (Playback remains paused unless user hits Play.)
         if self._ignore_timeline_callback:
             self._scrubbing = False
             return
@@ -396,17 +463,21 @@ class ViewerWindow(tk.Toplevel):
             self._ignore_timeline_callback = False
         self._set_time_from_t_rel(q)
 
-        # Resume playback if we were playing prior to scrubbing
+        # resume if we were playing before scrubbing
         self.playing = bool(self._was_playing_before_scrub)
 
         if self.debug_anim_var.get():
-            print(
-                f"[anim] scrub release raw={raw:.2f} q={q} step={step}ms "
-                f"resume={self.playing}"
-            )
+            print(f"[anim] scrub release raw={raw:.2f} q={q} step={step}ms resume={self.playing}")
 
+        self._scrubbing = False
+        if self.playing:
+            # ensure tick loop continues after scrub
+            self.after(self.TICK_MS, self._tick)
+
+    # -----------------------------
+    # Misc UI actions
+    # -----------------------------
     def _open_geosets_popup(self) -> None:
-        # Lazily build a popup with checkboxes for each geoset in the current mesh.
         if self._mesh is None:
             return
         sub = getattr(self._mesh, "submeshes", None)
@@ -424,20 +495,18 @@ class ViewerWindow(tk.Toplevel):
         top.resizable(False, True)
         self._geosets_popup = top
 
-        # Ensure vars exist and default ON
         self._geoset_vars = []
-        for i in range(count):
+        for _i in range(count):
             v = tk.BooleanVar(value=True)
             self._geoset_vars.append(v)
 
         frm = ttk.Frame(top, padding=10)
         frm.pack(fill="both", expand=True)
 
-        # All / None buttons
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(0, 8))
         ttk.Button(btns, text="All", command=lambda: self._set_all_geosets(True)).pack(side="left")
-        ttk.Button(btns, text="None", command=lambda: self._set_all_geosets(False)).pack(side="left", padx=(6,0))
+        ttk.Button(btns, text="None", command=lambda: self._set_all_geosets(False)).pack(side="left", padx=(6, 0))
 
         for i, v in enumerate(self._geoset_vars):
             cb = ttk.Checkbutton(frm, text=f"Geoset {i}", variable=v, command=self._on_geoset_toggle)
@@ -451,7 +520,6 @@ class ViewerWindow(tk.Toplevel):
             if self.gl is None:
                 return
 
-            # existing flags
             try:
                 self.gl.set_debug_alpha_off(bool(self.dbg_alpha_off_var.get()))
             except Exception:
@@ -469,13 +537,11 @@ class ViewerWindow(tk.Toplevel):
             except Exception:
                 pass
 
-            # NEW: UV debug
             try:
                 self.gl.set_debug_flip_v(bool(self.dbg_flip_v_var.get()))
             except Exception:
                 pass
 
-            # NEW: TeamColor debug
             try:
                 self.gl.set_teamcolor_mode(str(self.teamcolor_mode_var.get()))
             except Exception:
@@ -490,11 +556,9 @@ class ViewerWindow(tk.Toplevel):
 
     def _make_neutral_bind_pose(self):
         world_mats = {}
-        # identity for every node id in rig
         for nid in self._rig.ids:
             world_mats[nid] = mat4_identity()
 
-        # optional: positions for bone drawing
         max_id = max(self._rig.ids) if self._rig.ids else -1
         world_pos = [(0.0, 0.0, 0.0)] * (max_id + 1 if max_id >= 0 else 0)
         for nid in self._rig.ids:
@@ -544,10 +608,10 @@ class ViewerWindow(tk.Toplevel):
         except Exception:
             pass
 
-    def _on_close(self) -> None:
+    def close(self) -> None:
+        """Stop playback, persist camera, and run optional close callback."""
         self.playing = False
 
-        # save camera state
         try:
             cam = self.gl.get_camera_state() if self.gl is not None else None
             if cam:
@@ -556,18 +620,24 @@ class ViewerWindow(tk.Toplevel):
         except Exception:
             pass
 
-        self.destroy()
+        if self._on_close_cb:
+            try:
+                self._on_close_cb()
+            except Exception:
+                pass
 
+    # -----------------------------
+    # Playback controls
+    # -----------------------------
     def _on_play(self) -> None:
         if self._evaluator is None:
-            print('Evaluator is None')
+            print("Evaluator is None")
             return
-        
+
         if not hasattr(self, "_seq_start_ms") or not hasattr(self, "_seq_end_ms"):
-        
-            print('No Start and / or Stop cannot animate')
+            print("No Start and / or Stop cannot animate")
             return
-        
+
         if not self.playing:
             self.playing = True
             self._tick()
@@ -576,30 +646,16 @@ class ViewerWindow(tk.Toplevel):
         self.playing = False
 
     def _on_rewind(self) -> None:
-        if self.seq is None:
-            return
-        self.t_ms = int(self.seq.start_ms)
-        self._render_current()
-    
-    def _on_rewind(self) -> None:
         if not hasattr(self, "_seq_start_ms"):
             return
         self.t_ms = int(self._seq_start_ms)
         self._render_current()
 
     def _tick(self) -> None:
-        
         if not self.playing or self._evaluator is None:
-            print('Self .Playing Not set')
             return
 
-        if self._evaluator is None:
-            print('Evaluator is None, Cannot Animate')
-            return
-        
-        # Need a valid sequence window from ImportedModel
         if not hasattr(self, "_seq_start_ms") or not hasattr(self, "_seq_end_ms"):
-            print('Start and/or Stop Not Defined, cannot animate')
             return
 
         speed = float(self.speed_var.get() or 1.0)
@@ -614,22 +670,23 @@ class ViewerWindow(tk.Toplevel):
             if self.loop_var.get():
                 self.t_ms = seq_start
             else:
-                # stop + auto-rewind
                 self.t_ms = seq_start
                 self.playing = False
 
         self._render_current()
-        self.after(self.TICK_MS, self._tick)
-        
+
+        if self.playing:
+            self.after(self.TICK_MS, self._tick)
+
+    # -----------------------------
+    # Data loading + render pipeline (unchanged)
+    # -----------------------------
     def _load_from_db(self) -> None:
         print("load from db called")
         self._mesh = None
         self._mesh_provider = None
         self._mdl = None  # ImportedModel (wc3mdl) stored for alpha/geosets/etc.
 
-        # ---------------------------------------------------------------------------------
-        # 0) Resolve mdl_path from DB (keep this part since your UI/DB points to mdl)
-        # ---------------------------------------------------------------------------------
         bones_json = dbmod.get_harvested_json_blob(self.con, self.unit_id, "bones")
         if bones_json is None:
             raise RuntimeError(
@@ -650,9 +707,7 @@ class ViewerWindow(tk.Toplevel):
         print(f"[viewer] MDL path from bones_json['mdl'] = {mdl_path}")
         print(f"[viewer] MDL exists={mdl_path.exists()} size={mdl_path.stat().st_size}")
 
-        # ---------------------------------------------------------------------------------
         # 1) Load mesh from disk (unchanged)
-        # ---------------------------------------------------------------------------------
         try:
             from .mesh_provider import MdlFileMeshProvider
 
@@ -697,12 +752,9 @@ class ViewerWindow(tk.Toplevel):
             self._mesh = None
             print(f"[viewer] Mesh load failed (bones-only): {e!r}")
 
-
-
         print("[viewer] importing MDL via wc3mdl.import_mdl ...")
         self._mdl = import_mdl(str(mdl_path))
 
-        # Find sequence by name in the imported model (authoritative)
         seq = next((s for s in self._mdl.sequences if s.name == self.sequence_name), None)
         if seq is None:
             available = [s.name for s in self._mdl.sequences]
@@ -711,29 +763,27 @@ class ViewerWindow(tk.Toplevel):
                 f"Available sequences: {available}"
             )
 
-        # Store sequence timing (absolute)
+        # Persist the selected sequence for features (e.g., export) that need
+        # access to the imported-model sequence interval.
+        self._seq = seq
+
         self._seq_start_ms = int(seq.start_abs)
         self._seq_end_ms = int(seq.end_abs)
         self._seq_dur_ms = int(seq.dur)
         self.t_ms = int(seq.start_abs)
         self._update_timeline_bounds()
 
-        print(
-            f"[viewer] seq={seq.name!r} start={self._seq_start_ms} end={self._seq_end_ms} dur={self._seq_dur_ms}"
-        )
+        print(f"[viewer] seq={seq.name!r} start={self._seq_start_ms} end={self._seq_end_ms} dur={self._seq_dur_ms}")
 
-        # --- rig once ---
         rig = build_rig_from_imported_model(self._mdl)
 
-        # --- playback anims (current sequence) ---
         play_anims = build_anims_for_sequence(self._mdl, seq.name)
         self._rig = rig
         self._evaluator = UnitAnimEvaluator(rig=rig, anims=play_anims)
 
-        # --- bind pose anims (prefer Stand) ---
         bind_seq = next((s for s in self._mdl.sequences if s.name == "Stand"), None)
         if bind_seq is None:
-            bind_seq = seq  # fallback
+            bind_seq = seq
 
         bind_anims = build_anims_for_sequence(self._mdl, bind_seq.name)
         bind_eval = UnitAnimEvaluator(rig=rig, anims=bind_anims)
@@ -741,23 +791,15 @@ class ViewerWindow(tk.Toplevel):
         bind_start = int(bind_seq.start_abs)
         bind_dur = int(bind_seq.dur)
 
-        #bind_pose = bind_eval.evaluate_pose(bind_start, bind_start, bind_dur)
+        # bind_pose = bind_eval.evaluate_pose(bind_start, bind_start, bind_dur)
         bind_pose = self._make_neutral_bind_pose()
         self.gl.set_bind_pose(bind_pose)
-        
-        
 
-        print(
-            f"[viewer] bind_pose set from {bind_seq.name!r} "
-            f"at t_abs={bind_start} (dur={bind_dur})"
-        )
+        print(f"[viewer] bind_pose set from {bind_seq.name!r} at t_abs={bind_start} (dur={bind_dur})")
 
-        # --- start playback cursor at CURRENT seq start ---
         self.t_ms = int(seq.start_abs)
         self._render_current()
-        # ---------------------------------------------------------------------------------
-        # 5) (Optional) You can print a quick geoset/geosetanim summary here
-        # ---------------------------------------------------------------------------------
+
         try:
             ga_ct = len(getattr(self._mdl, "geoset_anims", {}) or {})
             gs_ct = len(getattr(self._mdl, "geosets", []) or [])
@@ -776,22 +818,18 @@ class ViewerWindow(tk.Toplevel):
                 if not vgroups:
                     return
 
-                # Case A: per-vertex single int (very common): [3,3,3,4,4,...]
                 if isinstance(vgroups, (list, tuple)) and vgroups and isinstance(vgroups[0], int):
                     ids.update(int(x) for x in vgroups)
                     return
 
-                # Otherwise treat as per-vertex "influence list"
                 for infl_list in vgroups:
                     if infl_list is None:
                         continue
 
-                    # Case B: each entry is int
                     if isinstance(infl_list, int):
                         ids.add(int(infl_list))
                         continue
 
-                    # Case C: dict influence
                     if isinstance(infl_list, dict):
                         for k in ("id", "bone", "bone_id", "group", "matrix"):
                             if k in infl_list:
@@ -802,7 +840,6 @@ class ViewerWindow(tk.Toplevel):
                                 break
                         continue
 
-                    # Case D: tuple like (id, weight)
                     if isinstance(infl_list, tuple):
                         if len(infl_list) >= 1:
                             try:
@@ -811,7 +848,6 @@ class ViewerWindow(tk.Toplevel):
                                 pass
                         continue
 
-                    # Case E: list/tuple of influences
                     if isinstance(infl_list, (list, tuple)):
                         for infl in infl_list:
                             if isinstance(infl, int):
@@ -829,9 +865,6 @@ class ViewerWindow(tk.Toplevel):
                                         except Exception:
                                             pass
                                         break
-                    else:
-                        # unknown scalar type, ignore
-                        pass
 
             add_from_vgroups(getattr(mesh, "vertex_groups", None))
             for sm in (getattr(mesh, "submeshes", None) or []):
@@ -849,17 +882,13 @@ class ViewerWindow(tk.Toplevel):
         if self._evaluator is None or self._rig is None or self._mdl is None:
             return
 
-        # Absolute timeline cursor (used for geoset alpha + for deriving t_rel)
         t_abs = int(self.t_ms)
 
-        # Sequence timing should come from ImportedModel (_load_from_db set these)
         seq_start = int(self._seq_start_ms)
         seq_dur = int(self._seq_dur_ms)
 
-        # Evaluate pose: evaluator should sample bone channels with t_rel = t_abs - seq_start
         pose = self._evaluator.evaluate_pose(t_abs, seq_start, seq_dur)
 
-        # Geoset visibility: absolute-time alpha + user checkbox
         enabled = []
         geosets = getattr(self._mdl, "geosets", []) or []
         geoset_anims = getattr(self._mdl, "geoset_anims", {}) or {}
@@ -879,7 +908,6 @@ class ViewerWindow(tk.Toplevel):
 
         self.gl.set_enabled_geosets(enabled)
 
-        # First render: restore persisted camera or do a default fit
         if not self._cam_init_done:
             restored = None
             try:
@@ -895,19 +923,17 @@ class ViewerWindow(tk.Toplevel):
             self.gl.snapshot_default_camera()
             self._cam_init_done = True
 
-        # Single pose submit (don’t call twice)
         self.gl.set_pose(pose, self._rig, active_ids=None)
 
         t_rel = int(t_abs - seq_start)
         pct = 0.0 if seq_dur <= 0 else (max(0.0, min(1.0, t_rel / float(seq_dur))) * 100.0)
-        # Prefer the actual active sequence name if available; otherwise use sequence_name
+
         active_seq_name = getattr(getattr(self, "_evaluator", None), "sequence_name", None)
         if not active_seq_name:
             active_seq_name = getattr(self, "sequence_name", "(seq)")
 
         self.time_lbl.config(text=f"{active_seq_name}  {t_rel}ms  ({pct:.1f}%)")
 
-        # Keep timeline slider in sync during playback (but never fight the user's drag)
         if not self._scrubbing:
             self._ignore_timeline_callback = True
             try:
@@ -917,3 +943,391 @@ class ViewerWindow(tk.Toplevel):
 
         if self.debug_anim_var.get():
             print(f"[anim] seq={active_seq_name!r} dur={seq_dur} t_rel={t_rel} t_abs={t_abs}")
+
+
+    # -----------------------------
+    # Export UI + implementation
+    # -----------------------------
+
+    def _on_export(self) -> None:
+        if not getattr(self, "_seq", None):
+            messagebox.showinfo("Export", "No animation is selected.")
+            return
+        self.ExportDialog(self)
+
+    def _derive_default_export_name(self, fmt: str) -> str:
+        fmt = (fmt or "gif").lower()
+        seq = getattr(self, "_seq", None)
+        anim_name = getattr(seq, "name", "animation") if seq else "animation"
+        anim_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", anim_name.strip()) or "animation"
+
+        mdl_path = None
+        try:
+            mdl_path = Path(getattr(self, "_mdl_path", "")) if getattr(self, "_mdl_path", None) else None
+        except Exception:
+            mdl_path = None
+
+        race = "unknown"
+        unit = "unit"
+        if mdl_path and mdl_path.exists():
+            parts = [p.lower() for p in mdl_path.parts]
+            for r in ("human", "orc", "undead", "nightelf", "neutral", "naga", "demon"):
+                if r in parts:
+                    race = r
+                    break
+            unit = mdl_path.parent.name or mdl_path.stem
+        else:
+            # best-effort fallback using window title / selector
+            try:
+                unit = getattr(self, "_unit_name", "unit")
+            except Exception:
+                unit = "unit"
+
+        unit_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", str(unit).strip()) or "unit"
+        race_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", str(race).strip()) or "unknown"
+        return f"{race_slug}-{unit_slug}-{anim_slug}.{fmt}"
+
+    def _find_ffmpeg(self, user_path: str = "") -> Optional[str]:
+        p = (user_path or "").strip().strip('"')
+        if p:
+            if os.path.isdir(p):
+                cand = os.path.join(p, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if os.path.exists(cand):
+                    return cand
+            if os.path.exists(p):
+                return p
+
+        cand = shutil.which("ffmpeg")
+        if cand:
+            return cand
+
+        # Common fallback locations
+        candidates = []
+        if os.name == "nt":
+            candidates += [
+                r"C:\\ffmpeg\\bin\\ffmpeg.exe",
+                r"C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+                r"C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe",
+            ]
+        else:
+            candidates += ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return None
+
+    def _export_animation(
+        self,
+        out_path: str,
+        fmt: str,
+        start_ms: float,
+        end_ms: float,
+        out_w: Optional[int],
+        out_h: Optional[int],
+        fps: int,
+        ffmpeg_path: str = "",
+    ) -> None:
+        """Export frames by stepping evaluator across time and capturing OpenGL framebuffer."""
+        fmt = (fmt or "gif").lower().strip()
+        if fmt not in ("gif", "mp4"):
+            raise ValueError("Unsupported format")
+
+        if self._evaluator is None or self._rig is None:
+            raise RuntimeError("Viewer is not ready (missing evaluator/rig)")
+
+        seq = self._seq
+        if seq is None:
+            raise RuntimeError("No animation selected")
+
+        # SequenceClip stores absolute timeline bounds as start_abs/end_abs and
+        # duration as dur.
+        seq_start = float(getattr(seq, "start_abs", 0.0))
+        seq_end = float(getattr(seq, "end_abs", seq_start + float(getattr(seq, "dur", 1.0))))
+        seq_dur = float(max(1.0, float(getattr(seq, "dur", max(1.0, seq_end - seq_start)))))
+
+        # clamp/normalize to relative ms within the sequence
+        s = max(0.0, min(float(start_ms), seq_dur))
+        e = max(0.0, min(float(end_ms), seq_dur))
+        if e <= s:
+            raise ValueError("End must be greater than start")
+
+        fps = int(fps) if int(fps) > 0 else 30
+
+        # Honor the viewer's playback speed multiplier so exported motion matches
+        # what the user sees when replay speed is adjusted.
+        try:
+            speed_mul = float(self.speed_var.get() or 1.0)
+        except Exception:
+            speed_mul = 1.0
+        if speed_mul <= 0:
+            speed_mul = 1.0
+
+        # Time step in *animation milliseconds* per output frame.
+        step = (1000.0 / float(fps)) * speed_mul
+
+        images = []
+        t = s
+        # Determine active bone IDs for rendering (matches _render_current behavior)
+        active_ids = None
+        try:
+            active_ids = getattr(self, "_active_bone_ids", None)
+        except Exception:
+            active_ids = None
+
+        while t <= e + 0.0001:
+            t_abs = seq_start + t
+            pose = self._evaluator.evaluate_pose(t_abs, seq_start, seq_dur)
+            self.gl.set_pose(pose, self._rig, active_ids)
+            # Force a draw (this will freeze UI; user said that's OK)
+            self.update_idletasks()
+            self.update()
+            img = self.gl.capture_image()
+            if img is None:
+                raise RuntimeError("OpenGL capture is unavailable (missing pyopengltk/PyOpenGL?)")
+
+            if out_w or out_h:
+                w0, h0 = img.size
+                if out_w and out_h:
+                    img = img.resize((int(out_w), int(out_h)), resample=Image.Resampling.LANCZOS)
+                elif out_w:
+                    nh = int(round(h0 * (float(out_w) / float(w0))))
+                    img = img.resize((int(out_w), nh), resample=Image.Resampling.LANCZOS)
+                elif out_h:
+                    nw = int(round(w0 * (float(out_h) / float(h0))))
+                    img = img.resize((nw, int(out_h)), resample=Image.Resampling.LANCZOS)
+
+            images.append(img)
+            t += step
+
+        if not images:
+            raise RuntimeError("No frames captured")
+
+        out_path = str(out_path)
+
+        if fmt == "gif":
+            duration_ms = int(round(1000.0 / float(fps)))
+            images[0].save(
+                out_path,
+                save_all=True,
+                append_images=images[1:],
+                duration=duration_ms,
+                loop=0,
+                optimize=False,
+                disposal=2,
+            )
+            return
+
+        # MP4: write PNG sequence then call ffmpeg
+        ffmpeg = self._find_ffmpeg(ffmpeg_path)
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg not found. Provide a path to ffmpeg to export MP4.")
+
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="wc3kin_export_") as td:
+            for i, img in enumerate(images):
+                img.save(os.path.join(td, f"frame_{i:05d}.png"))
+            # -pix_fmt yuv420p improves compatibility
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-framerate",
+                str(fps),
+                "-i",
+                os.path.join(td, "frame_%05d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                out_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    "ffmpeg failed:\n"
+                    + (proc.stdout or "")
+                    + "\n"
+                    + (proc.stderr or "")
+                )
+
+
+    class ExportDialog(tk.Toplevel):
+        def __init__(self, viewer: "ViewerPanel"):
+            super().__init__(viewer)
+            self.viewer = viewer
+            self.title("Export Animation")
+            self.resizable(False, False)
+            self.transient(viewer.winfo_toplevel())
+            self.grab_set()
+
+            self.fmt_var = tk.StringVar(value="gif")
+            self.path_var = tk.StringVar(value="")
+            self.ffmpeg_var = tk.StringVar(value="")
+            self.w_var = tk.StringVar(value="")
+            self.h_var = tk.StringVar(value="")
+            self.fps_var = tk.StringVar(value="30")
+
+            seq = viewer._seq
+            seq_start = float(getattr(seq, 'start_abs', 0))
+            seq_end = float(getattr(seq, 'end_abs', seq_start + getattr(seq, 'dur', 1)))
+            seq_dur = float(max(1, getattr(seq, 'dur', int(seq_end - seq_start))))
+
+            self.start_ms_var = tk.StringVar(value="0")
+            self.end_ms_var = tk.StringVar(value=str(int(seq_dur)))
+
+            body = ttk.Frame(self, padding=12)
+            body.pack(fill="both", expand=True)
+
+            # Format
+            fmt_row = ttk.Frame(body)
+            fmt_row.pack(fill="x")
+            ttk.Label(fmt_row, text="Format:").pack(side="left")
+            ttk.Radiobutton(fmt_row, text="GIF", value="gif", variable=self.fmt_var, command=self._sync_default_name).pack(side="left", padx=(8, 0))
+            ttk.Radiobutton(fmt_row, text="MP4", value="mp4", variable=self.fmt_var, command=self._sync_default_name).pack(side="left", padx=(8, 0))
+
+            # Save as
+            save_row = ttk.Frame(body)
+            save_row.pack(fill="x", pady=(10, 0))
+            ttk.Button(save_row, text="Save as…", command=self._choose_out).pack(side="left")
+            ttk.Label(save_row, textvariable=self.path_var).pack(side="left", padx=(8, 0))
+
+            # ffmpeg
+            ff_row = ttk.Frame(body)
+            ff_row.pack(fill="x", pady=(10, 0))
+            ttk.Button(ff_row, text="Locate ffmpeg…", command=self._choose_ffmpeg).pack(side="left")
+            ttk.Label(ff_row, textvariable=self.ffmpeg_var).pack(side="left", padx=(8, 0))
+
+            # Scaling
+            scale = ttk.LabelFrame(body, text="Scaling (optional)")
+            scale.pack(fill="x", pady=(10, 0))
+            srow = ttk.Frame(scale)
+            srow.pack(fill="x", padx=8, pady=6)
+            ttk.Label(srow, text="Width:").pack(side="left")
+            ttk.Entry(srow, textvariable=self.w_var, width=8).pack(side="left", padx=(6, 12))
+            ttk.Label(srow, text="Height:").pack(side="left")
+            ttk.Entry(srow, textvariable=self.h_var, width=8).pack(side="left", padx=(6, 0))
+
+            # Trim
+            trim = ttk.LabelFrame(body, text="Trim (ms within this animation)")
+            trim.pack(fill="x", pady=(10, 0))
+            trow = ttk.Frame(trim)
+            trow.pack(fill="x", padx=8, pady=6)
+            ttk.Label(trow, text="Start:").pack(side="left")
+            ttk.Entry(trow, textvariable=self.start_ms_var, width=10).pack(side="left", padx=(6, 12))
+            ttk.Label(trow, text="End:").pack(side="left")
+            ttk.Entry(trow, textvariable=self.end_ms_var, width=10).pack(side="left", padx=(6, 0))
+
+            # FPS
+            fps_row = ttk.Frame(body)
+            fps_row.pack(fill="x", pady=(10, 0))
+            ttk.Label(fps_row, text="FPS:").pack(side="left")
+            ttk.Entry(fps_row, textvariable=self.fps_var, width=6).pack(side="left", padx=(6, 0))
+
+            # Buttons
+            btns = ttk.Frame(body)
+            btns.pack(fill="x", pady=(12, 0))
+            ttk.Button(btns, text="Export", command=self._export).pack(side="right")
+            ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 8))
+
+            self._sync_default_name()
+
+        def _sync_default_name(self) -> None:
+            fmt = (self.fmt_var.get() or "gif").lower()
+            default_name = self.viewer._derive_default_export_name(fmt)
+            if not self.path_var.get():
+                # Put it in cwd by default; Save As will override
+                self.path_var.set(str(Path.cwd() / default_name))
+
+        def _choose_out(self) -> None:
+            fmt = (self.fmt_var.get() or "gif").lower()
+            default_name = self.viewer._derive_default_export_name(fmt)
+            ext = f".{fmt}"
+            path = filedialog.asksaveasfilename(
+                parent=self,
+                title="Save animation",
+                initialfile=default_name,
+                defaultextension=ext,
+                filetypes=[(fmt.upper(), f"*{ext}"), ("All files", "*.*")],
+            )
+            if path:
+                self.path_var.set(path)
+
+        def _choose_ffmpeg(self) -> None:
+            path = filedialog.askopenfilename(
+                parent=self,
+                title="Select ffmpeg executable",
+                filetypes=[("ffmpeg", "ffmpeg*"), ("All files", "*.*")],
+            )
+            if path:
+                self.ffmpeg_var.set(path)
+
+        def _export(self) -> None:
+            out_path = (self.path_var.get() or "").strip()
+            if not out_path:
+                messagebox.showerror("Export", "Choose a Save As path first.")
+                return
+
+            fmt = (self.fmt_var.get() or "gif").lower()
+            try:
+                start_ms = float(self.start_ms_var.get().strip() or "0")
+                end_ms = float(self.end_ms_var.get().strip() or "0")
+                fps = int(float(self.fps_var.get().strip() or "30"))
+                w = self.w_var.get().strip()
+                h = self.h_var.get().strip()
+                out_w = int(float(w)) if w else None
+                out_h = int(float(h)) if h else None
+            except Exception:
+                messagebox.showerror("Export", "Invalid numeric input (start/end/fps/width/height).")
+                return
+
+            try:
+                self.viewer._export_animation(
+                    out_path=out_path,
+                    fmt=fmt,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    out_w=out_w,
+                    out_h=out_h,
+                    fps=fps,
+                    ffmpeg_path=self.ffmpeg_var.get(),
+                )
+            except Exception as e:
+                messagebox.showerror("Export failed", str(e))
+                return
+
+            messagebox.showinfo("Export", f"Exported: {out_path}")
+            self.destroy()
+
+class ViewerWindow(tk.Toplevel):
+    """
+    Backwards-compatible wrapper around ViewerPanel.
+    Use this if you still want the viewer in its own window.
+    """
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        con: sqlite3.Connection,
+        units_root: Path,
+        unit_id: int,
+        sequence_name: str,
+    ) -> None:
+        super().__init__(master)
+        self.title("WC3 Viewer")
+        self.geometry("980x680")
+
+        self._panel = ViewerPanel(
+            self,
+            con=con,
+            units_root=units_root,
+            unit_id=unit_id,
+            sequence_name=sequence_name,
+            on_close=self.destroy,
+            build_menus_on=self,
+        )
+        self._panel.pack(fill="both", expand=True)
+
+        self.protocol("WM_DELETE_WINDOW", self._panel.close)
+
+
+
